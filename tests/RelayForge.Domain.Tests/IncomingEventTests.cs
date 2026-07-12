@@ -47,6 +47,18 @@ public sealed class IncomingEventTests
         Assert.Equal(2, delivery.AttemptCount);
     }
 
+    [Fact]
+    public void Replayed_delivery_can_start_processing()
+    {
+        var delivery = CreateDelivery(); var now = DateTimeOffset.UtcNow; var firstLease = Guid.NewGuid();
+        Assert.True(delivery.StartProcessing(firstLease, now.AddMinutes(1), now).TryGetValue(out _));
+        Assert.True(delivery.DeadLetter(firstLease, now).TryGetValue(out _));
+        Assert.True(delivery.Replay(now).TryGetValue(out _));
+
+        Assert.True(delivery.StartProcessing(Guid.NewGuid(), now.AddMinutes(1), now).TryGetValue(out _));
+        Assert.Equal(DeliveryStatus.Processing, delivery.Status);
+    }
+
     private static Delivery CreateDelivery()
     {
         var result = IncomingEvent.Create(new WebhookEndpointId(Guid.NewGuid()), "x", "{}", Guid.NewGuid().ToString(), new string('a', 64));

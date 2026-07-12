@@ -17,8 +17,16 @@ public sealed class DeliveryWorker(IServiceScopeFactory scopes, IOptions<Deliver
             await using var scope = scopes.CreateAsyncScope();
             var repository = scope.ServiceProvider.GetRequiredService<DeliveryLeaseRepository>();
             var leases = await repository.ClaimAsync(settings.BatchSize, settings.LeaseDuration, stoppingToken);
-            await Parallel.ForEachAsync(leases, new ParallelOptions { MaxDegreeOfParallelism = settings.MaxConcurrency, CancellationToken = stoppingToken },
-                async (lease, token) => { await using var itemScope = scopes.CreateAsyncScope(); await itemScope.ServiceProvider.GetRequiredService<DeliveryDispatcher>().DispatchAsync(lease, token); });
+            try
+            {
+                await Parallel.ForEachAsync(leases, new ParallelOptions { MaxDegreeOfParallelism = settings.MaxConcurrency, CancellationToken = stoppingToken },
+                    async (lease, token) => { await using var itemScope = scopes.CreateAsyncScope(); await itemScope.ServiceProvider.GetRequiredService<DeliveryDispatcher>().DispatchAsync(lease, token); });
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                foreach (var lease in leases) await repository.ReleaseAsync(lease, null, "Worker stopped before delivery.", CancellationToken.None);
+                throw;
+            }
         } while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 }

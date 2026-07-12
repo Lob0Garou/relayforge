@@ -65,7 +65,7 @@ public sealed class Delivery
 
     public DomainResult<Delivery> StartProcessing(Guid leaseId, DateTimeOffset expiresAt, DateTimeOffset now)
     {
-        if (Status != DeliveryStatus.Pending || leaseId == Guid.Empty || expiresAt <= now) return InvalidTransition();
+        if (Status is not (DeliveryStatus.Pending or DeliveryStatus.Replayed) || leaseId == Guid.Empty || expiresAt <= now) return InvalidTransition();
         SetLease(leaseId, expiresAt); return DomainResult<Delivery>.Success(this);
     }
 

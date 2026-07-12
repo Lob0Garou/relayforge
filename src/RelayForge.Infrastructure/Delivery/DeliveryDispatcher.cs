@@ -26,6 +26,11 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             if (response.StatusCode is < HttpStatusCode.OK or >= HttpStatusCode.MultipleChoices) error = $"HTTP {(int)response.StatusCode}";
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { error = "Request timed out."; }
+        catch (OperationCanceledException)
+        {
+            await repository.ReleaseAsync(lease, startedAt, "Delivery cancelled.", CancellationToken.None);
+            throw;
+        }
         catch (HttpRequestException exception) { error = $"Network error: {exception.HttpRequestError}."; }
         await repository.FinalizeAsync(lease, startedAt, status, error, cancellationToken);
     }
