@@ -29,6 +29,7 @@ public sealed class PostgreSqlFixture : IAsyncLifetime
     public async Task ResetAsync()
     {
         await using var scope = Factory.Services.CreateAsyncScope();
+        await scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>().IncomingEvents.ExecuteDeleteAsync();
         await scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>().WebhookEndpoints.ExecuteDeleteAsync();
     }
 

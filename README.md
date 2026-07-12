@@ -1,5 +1,9 @@
 # RelayForge
 
+## Event ingestion idempotency
+
+`POST /api/events` uses a single-tenant, globally unique `Idempotency-Key` in the MVP. Replays with the same endpoint, event type, and semantically equivalent JSON payload return the original event and delivery IDs. Reusing the key for any different endpoint, event type, or payload returns `409 Conflict`.
+
 Reliable webhook delivery and replay platform built with .NET 8 and React.
 
 RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.

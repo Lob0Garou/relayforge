@@ -55,6 +55,7 @@ var app = builder.Build();
 app.UseExceptionHandler();
 app.MapHealthChecks("/health/live");
 app.MapWebhookEndpoints();
+app.MapEventRoutes();
 
 app.Run();
 
