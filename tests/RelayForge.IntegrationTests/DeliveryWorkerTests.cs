@@ -226,7 +226,7 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
         await worker.StartAsync(default); await WaitForAttemptsAsync(2); await worker.StopAsync(default);
         await using var verify = await Factory().CreateDbContextAsync(); var attempts = await verify.DeliveryAttempts.OrderBy(x => x.Outcome).ToListAsync();
         Assert.Equal(2, attempts.Count); Assert.Contains(attempts, x => x.Outcome == DeliveryAttemptOutcome.Delivered);
-        var poison = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("Delivery processing failed.", poison.Error); Assert.Equal(1, handler.Calls);
+        var poison = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("processing_failure", poison.Error); Assert.Equal(1, handler.Calls);
     }
 
     [Fact]
@@ -237,7 +237,56 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
         var handler = new FirstThrowsHandler(); var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System);
         await Task.WhenAll(leases.Select(x => dispatcher.DispatchAsync(x, default)));
         await using var db = await Factory().CreateDbContextAsync(); var attempts = await db.DeliveryAttempts.ToListAsync();
-        Assert.Contains(attempts, x => x.Outcome == DeliveryAttemptOutcome.Delivered); var failed = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("Delivery processing failed.", failed.Error);
+        Assert.Contains(attempts, x => x.Outcome == DeliveryAttemptOutcome.Delivered); var failed = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("processing_failure", failed.Error);
+    }
+
+    [Fact]
+    public async Task Future_retry_is_not_claimed_but_database_due_retry_is_claimed()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var repository = Repository();
+        var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await new DeliveryDispatcher(repository, new SingleClientFactory(new RecordingHandler(HttpStatusCode.ServiceUnavailable)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System).DispatchAsync(lease, default);
+        Assert.Empty(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await using (var db = await Factory().CreateDbContextAsync()) await db.Database.ExecuteSqlRawAsync("UPDATE deliveries SET next_attempt_at = clock_timestamp() - interval '1 millisecond'");
+        Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+    }
+
+    [Fact]
+    public async Task Permanent_400_dead_letters_immediately_and_503_dead_letters_on_fifth_attempt()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var repository = Repository();
+        var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await new DeliveryDispatcher(repository, new SingleClientFactory(new RecordingHandler(HttpStatusCode.BadRequest)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System).DispatchAsync(lease, default);
+        await using (var db = await Factory().CreateDbContextAsync()) Assert.Equal(DeliveryStatus.DeadLettered, (await db.Deliveries.SingleAsync()).Status);
+
+        await fixture.ResetAsync(); await SeedAsync(); repository = Repository();
+        for (var attempt = 1; attempt <= 5; attempt++)
+        {
+            lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+            await new DeliveryDispatcher(repository, new SingleClientFactory(new RecordingHandler(HttpStatusCode.ServiceUnavailable)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System).DispatchAsync(lease, default);
+            if (attempt < 5) await using (var db = await Factory().CreateDbContextAsync()) await db.Database.ExecuteSqlRawAsync("UPDATE deliveries SET next_attempt_at = clock_timestamp() - interval '1 millisecond'");
+        }
+        await using var verify = await Factory().CreateDbContextAsync(); var delivery = await verify.Deliveries.SingleAsync();
+        Assert.Equal(DeliveryStatus.DeadLettered, delivery.Status); Assert.Equal(5, delivery.AttemptCount); Assert.Equal(5, await verify.DeliveryAttempts.CountAsync());
+    }
+
+    [Fact]
+    public async Task Transient_failures_twice_then_succeed_on_third_and_429_respects_retry_after()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var repository = Repository();
+        var handler = new SequenceHandler(HttpStatusCode.ServiceUnavailable, HttpStatusCode.ServiceUnavailable, HttpStatusCode.NoContent);
+        var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System);
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default)); await dispatcher.DispatchAsync(lease, default);
+            if (attempt < 3) await using (var db = await Factory().CreateDbContextAsync()) await db.Database.ExecuteSqlRawAsync("UPDATE deliveries SET next_attempt_at = clock_timestamp() - interval '1 millisecond'");
+        }
+        await using (var db = await Factory().CreateDbContextAsync()) { Assert.Equal(DeliveryStatus.Delivered, (await db.Deliveries.SingleAsync()).Status); Assert.Equal(3, await db.DeliveryAttempts.CountAsync()); }
+
+        await fixture.ResetAsync(); await SeedAsync(); repository = Repository(); var lease429 = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await new DeliveryDispatcher(repository, new SingleClientFactory(new RetryAfterHandler()), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System).DispatchAsync(lease429, default);
+        await using var verify = await Factory().CreateDbContextAsync(); var seconds = await verify.Database.SqlQuery<double>($"SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp())) AS \"Value\" FROM deliveries").SingleAsync();
+        Assert.InRange(seconds, 115, 120);
     }
 
     [Fact]
@@ -319,4 +368,6 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private sealed class BlockingClaimObserver : IDeliveryClaimObserver { public TaskCompletionSource Captured { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public async Task SnapshotCapturedAsync(CancellationToken cancellationToken) { Captured.SetResult(); await Release.Task.WaitAsync(cancellationToken); } }
     private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider { public override DateTimeOffset GetUtcNow() => value; }
     private sealed class FirstThrowsHandler : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("secret details") : Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent)); }
+    private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
+    private sealed class RetryAfterHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests); response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(120)); return Task.FromResult(response); } }
 }

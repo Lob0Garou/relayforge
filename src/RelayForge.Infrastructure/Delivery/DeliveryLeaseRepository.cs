@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using RelayForge.Domain.Events;
 using RelayForge.Infrastructure.Persistence;
+using RelayForge.Domain.Retry;
 
 namespace RelayForge.Infrastructure.Delivery;
 
@@ -18,7 +19,9 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
         var rows = await db.Database.SqlQuery<DeliveryLeaseRow>($"""
             WITH candidates AS (
               SELECT "Id" FROM deliveries
-              WHERE "Status" IN ('Pending', 'Replayed') OR ("Status" = 'Processing' AND lease_expires_at <= clock_timestamp())
+              WHERE "Status" IN ('Pending', 'Replayed')
+                 OR ("Status" = 'RetryScheduled' AND next_attempt_at <= clock_timestamp())
+                 OR ("Status" = 'Processing' AND lease_expires_at <= clock_timestamp())
               ORDER BY "CreatedAt" FOR UPDATE SKIP LOCKED LIMIT {batchSize}
             ), claimed AS (
               UPDATE deliveries d SET "Status" = 'Processing', lease_id = {leaseId},
@@ -40,17 +43,25 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
 
     public async Task<bool> FinalizeAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, string? error, CancellationToken cancellationToken)
     {
+        var failure = statusCode is { } code ? DeliveryFailureClassifier.FromHttpStatus(code) : DeliveryFailureClassifier.Network();
+        var decision = failure.Kind == DeliveryFailureKind.Success ? null : new RetryPolicy(new(), new SystemJitterSource()).Decide(failure, lease.AttemptNumber, null, startedAt);
+        return await FinalizeAsync(lease, startedAt, statusCode, failure.ReasonCode, decision, cancellationToken);
+    }
+
+    public async Task<bool> FinalizeAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, string reasonCode, RetryDecision? decision, CancellationToken cancellationToken)
+    {
         await using var db = await factory.CreateDbContextAsync(cancellationToken); await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        var success = statusCode is >= 200 and < 300; var target = success ? "Delivered" : "RetryScheduled"; var deliveryId = new DeliveryId(lease.DeliveryId);
+        var success = decision is null; var target = decision switch { null => "Delivered", RetryDecision.Retry => "RetryScheduled", _ => "DeadLettered" };
+        var delay = decision is RetryDecision.Retry retry ? retry.Delay : TimeSpan.Zero; var deliveryId = new DeliveryId(lease.DeliveryId);
         var completed = await db.Database.SqlQuery<DateTimeOffset>($"""
             UPDATE deliveries SET "Status" = {target}, lease_id = NULL, lease_expires_at = NULL,
-              next_attempt_at = CASE WHEN {success} THEN NULL ELSE clock_timestamp() END, version = version + 1
+              next_attempt_at = CASE WHEN {target} = 'RetryScheduled' THEN clock_timestamp() + {delay} ELSE NULL END, version = version + 1
             WHERE "Id" = {lease.DeliveryId} AND "Status" = 'Processing' AND lease_id = {lease.LeaseId}
               AND version = {lease.FencingToken} AND lease_expires_at > clock_timestamp()
             RETURNING clock_timestamp() AS "Value"
             """).ToListAsync(cancellationToken);
         if (completed.Count == 0) { await transaction.RollbackAsync(cancellationToken); return false; }
-        db.DeliveryAttempts.Add(DeliveryAttempt.Create(deliveryId, lease.AttemptNumber, startedAt, completed[0], success ? DeliveryAttemptOutcome.Delivered : DeliveryAttemptOutcome.Failed, statusCode, error));
+        db.DeliveryAttempts.Add(DeliveryAttempt.Create(deliveryId, lease.AttemptNumber, startedAt, completed[0], success ? DeliveryAttemptOutcome.Delivered : DeliveryAttemptOutcome.Failed, statusCode, success ? null : reasonCode));
         await db.SaveChangesAsync(cancellationToken); await transaction.CommitAsync(cancellationToken); return true;
     }
 

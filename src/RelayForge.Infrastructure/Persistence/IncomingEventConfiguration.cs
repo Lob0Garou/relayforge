@@ -40,6 +40,7 @@ public sealed class DeliveryConfiguration : IEntityTypeConfiguration<RelayForge.
         builder.HasMany(x => x.Attempts).WithOne().HasForeignKey(x => x.DeliveryId).OnDelete(DeleteBehavior.Cascade);
         builder.HasIndex(x => x.EventId).IsUnique();
         builder.HasIndex(x => new { x.Status, x.CreatedAt }).HasDatabaseName("ix_deliveries_ready").HasFilter("\"Status\" IN ('Pending', 'Replayed')");
+        builder.HasIndex(x => new { x.NextAttemptAt, x.CreatedAt }).HasDatabaseName("ix_deliveries_retry_due").HasFilter("\"Status\" = 'RetryScheduled'");
         builder.HasIndex(x => new { x.LeaseExpiresAt, x.CreatedAt }).HasDatabaseName("ix_deliveries_expired_leases").HasFilter("\"Status\" = 'Processing'");
         builder.HasOne<RelayForge.Domain.Endpoints.WebhookEndpoint>().WithMany().HasForeignKey(x => x.EndpointId).OnDelete(DeleteBehavior.Restrict);
     }

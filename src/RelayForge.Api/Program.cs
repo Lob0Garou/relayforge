@@ -4,6 +4,7 @@ using System.Security.Cryptography.X509Certificates;
 using RelayForge.Api.Endpoints;
 using RelayForge.Infrastructure.Persistence;
 using RelayForge.Infrastructure.Delivery;
+using RelayForge.Domain.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,6 +19,8 @@ builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
+builder.Services.AddSingleton<IJitterSource, SystemJitterSource>();
+builder.Services.AddSingleton(sp => new RetryPolicy(new RetryPolicyOptions(), sp.GetRequiredService<IJitterSource>()));
 builder.Services.AddOptions<DeliveryWorkerOptions>().Bind(builder.Configuration.GetSection("DeliveryWorker"))
     .Validate(x => x.BatchSize is >= 1 and <= 100, "BatchSize must be between 1 and 100.")
     .Validate(x => x.MaxConcurrency is >= 1 and <= 64, "MaxConcurrency must be between 1 and 64.")
@@ -68,6 +71,7 @@ app.UseExceptionHandler();
 app.MapHealthChecks("/health/live");
 app.MapWebhookEndpoints();
 app.MapEventRoutes();
+app.MapDeadLetterRoutes();
 
 app.Run();
 

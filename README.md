@@ -56,6 +56,8 @@ Configure its bounded failure scenario with `PUT /operations/scenario`; each rec
 atomically clears the prior attempt counters. Status codes 400-599 are intentionally accepted so
 the simulator can model both terminal and transient failures. Send signed raw bodies to
 `POST /webhooks/relayforge`, and inspect attempts at `GET /operations/deliveries/{deliveryId}`.
+
+Delivery failures use five total attempts by default. Transient failures are scheduled by PostgreSQL with capped exponential backoff and jitter; permanent failures and exhausted transient failures are dead-lettered. Operators can list sanitized dead letters at `GET /api/dead-letters` (manual replay is intentionally not available yet).
 For any non-Development environment set `Receiver__SigningSecret` through configuration or the
 environment. The simulator's state is deliberately thread-safe but in-memory and process-local: it
 is a demo receiver, not a broker, durable queue, or delivery source of truth.

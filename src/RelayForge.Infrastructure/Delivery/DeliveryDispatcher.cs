@@ -2,14 +2,15 @@ using System.Net;
 using System.Text;
 using Microsoft.AspNetCore.DataProtection;
 using RelayForge.Infrastructure.Security;
+using RelayForge.Domain.Retry;
 
 namespace RelayForge.Infrastructure.Delivery;
 
-public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttpClientFactory clients, IDataProtectionProvider protection, TimeProvider clock)
+public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttpClientFactory clients, IDataProtectionProvider protection, TimeProvider clock, RetryPolicy? retryPolicy = null)
 {
     public async Task DispatchAsync(DeliveryLease lease, CancellationToken cancellationToken)
     {
-        var startedAt = clock.GetUtcNow(); int? status = null; string? error = null;
+        var startedAt = clock.GetUtcNow(); int? status = null; string? retryAfter = null; var failure = DeliveryFailureClassifier.Processing();
         try
         {
             var body = Encoding.UTF8.GetBytes(lease.Payload);
@@ -23,16 +24,19 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); timeout.CancelAfter(lease.Timeout);
             using var response = await clients.CreateClient("RelayForgeDelivery").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             status = (int)response.StatusCode;
-            if (response.StatusCode is < HttpStatusCode.OK or >= HttpStatusCode.MultipleChoices) error = $"HTTP {(int)response.StatusCode}";
+            failure = DeliveryFailureClassifier.FromHttpStatus(status.Value);
+            retryAfter = response.Headers.RetryAfter?.ToString();
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { error = "Request timed out."; }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { failure = DeliveryFailureClassifier.Timeout(); }
         catch (OperationCanceledException)
         {
-            await repository.ReleaseAsync(lease, startedAt, "Delivery cancelled.", CancellationToken.None);
+            await repository.ReleaseAsync(lease, startedAt, "worker_cancelled", CancellationToken.None);
             throw;
         }
-        catch (HttpRequestException exception) { error = $"Network error: {exception.HttpRequestError}."; }
-        catch (Exception) { error = "Delivery processing failed."; }
-        await repository.FinalizeAsync(lease, startedAt, status, error, cancellationToken);
+        catch (HttpRequestException) { failure = DeliveryFailureClassifier.Network(); }
+        catch (Exception) { failure = DeliveryFailureClassifier.Processing(); }
+        var decision = failure.Kind == DeliveryFailureKind.Success ? null : (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(failure, lease.AttemptNumber, retryAfter, clock.GetUtcNow());
+        var reasonCode = decision is RetryDecision.DeadLetter deadLetter ? deadLetter.ReasonCode : failure.ReasonCode;
+        await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken);
     }
 }

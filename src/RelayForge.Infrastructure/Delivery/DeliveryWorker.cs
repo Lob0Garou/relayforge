@@ -24,7 +24,7 @@ public sealed class DeliveryWorker(IServiceScopeFactory scopes, IOptions<Deliver
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                foreach (var lease in leases) await repository.ReleaseAsync(lease, null, "Worker stopped before delivery.", CancellationToken.None);
+                foreach (var lease in leases) await repository.ReleaseAsync(lease, null, "worker_stopped", CancellationToken.None);
                 throw;
             }
         } while (await timer.WaitForNextTickAsync(stoppingToken));
