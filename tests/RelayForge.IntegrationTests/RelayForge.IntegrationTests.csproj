@@ -11,6 +11,5 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/RelayForge.Api/RelayForge.Api.csproj" />
-    <ProjectReference Include="../../src/RelayForge.Infrastructure/RelayForge.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

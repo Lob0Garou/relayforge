@@ -4,6 +4,8 @@ Reliable webhook delivery and replay platform built with .NET 8 and React.
 
 RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.
 
+The projects target .NET 8 (`net8.0`). The repository quickstart requires the .NET SDK 10.0.301 or newer in the same feature band, as pinned by `global.json`, to support the `.slnx` solution format.
+
 ## Quickstart
 
 ```powershell
