@@ -1,0 +1,13 @@
+.worktrees/
+bin/
+obj/
+.vs/
+.idea/
+node_modules/
+dist/
+playwright-report/
+test-results/
+.env
+.env.*
+!.env.example
+
