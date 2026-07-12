@@ -3,17 +3,24 @@ using Microsoft.EntityFrameworkCore;
 using System.Security.Cryptography.X509Certificates;
 using RelayForge.Api.Endpoints;
 using RelayForge.Infrastructure.Persistence;
+using RelayForge.Infrastructure.Delivery;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
-builder.Services.AddDbContext<RelayForgeDbContext>(options =>
+builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 {
     options.UseNpgsql(builder.Configuration.GetConnectionString("RelayForge") ??
         "Host=localhost;Port=5432;Database=relayforge;Username=relayforge;Password=relayforge");
     options.UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking);
 });
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddScoped<DeliveryLeaseRepository>();
+builder.Services.AddScoped<DeliveryDispatcher>();
+builder.Services.Configure<DeliveryWorkerOptions>(builder.Configuration.GetSection("DeliveryWorker"));
+builder.Services.AddHttpClient("RelayForgeDelivery").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.AddHostedService<DeliveryWorker>();
 
 var keysPath = builder.Configuration["DataProtection:KeysPath"];
 if (builder.Environment.IsDevelopment())

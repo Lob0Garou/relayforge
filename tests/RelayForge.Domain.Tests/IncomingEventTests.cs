@@ -8,6 +8,53 @@ namespace RelayForge.Domain.Tests;
 public sealed class IncomingEventTests
 {
     [Fact]
+    public void Delivery_enforces_explicit_state_transitions()
+    {
+        var delivery = CreateDelivery();
+        var lease = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+
+        Assert.True(delivery.StartProcessing(lease, now.AddMinutes(1), now).TryGetValue(out _));
+        Assert.True(delivery.MarkDelivered(lease, now.AddSeconds(1)).TryGetValue(out _));
+        Assert.Equal(DeliveryStatus.Delivered, delivery.Status);
+        Assert.False(delivery.ScheduleRetry(lease, now.AddSeconds(2)).TryGetValue(out _));
+    }
+
+    [Fact]
+    public void Stale_lease_cannot_finalize_delivery()
+    {
+        var delivery = CreateDelivery();
+        var now = DateTimeOffset.UtcNow;
+        Assert.True(delivery.StartProcessing(Guid.NewGuid(), now.AddMinutes(1), now).TryGetValue(out _));
+
+        var result = delivery.MarkDelivered(Guid.NewGuid(), now.AddSeconds(1));
+
+        Assert.False(result.TryGetValue(out _));
+        Assert.Equal("delivery.lease_mismatch", result.Error.Code);
+        Assert.Equal(DeliveryStatus.Processing, delivery.Status);
+    }
+
+    [Fact]
+    public void Expired_processing_delivery_can_be_recovered_with_a_new_lease()
+    {
+        var delivery = CreateDelivery();
+        var now = DateTimeOffset.UtcNow;
+        Assert.True(delivery.StartProcessing(Guid.NewGuid(), now.AddSeconds(1), now).TryGetValue(out _));
+
+        var newLease = Guid.NewGuid();
+        Assert.True(delivery.RecoverExpiredLease(newLease, now.AddMinutes(2), now.AddSeconds(2)).TryGetValue(out _));
+        Assert.Equal(newLease, delivery.LeaseId);
+        Assert.Equal(2, delivery.AttemptCount);
+    }
+
+    private static Delivery CreateDelivery()
+    {
+        var result = IncomingEvent.Create(new WebhookEndpointId(Guid.NewGuid()), "x", "{}", Guid.NewGuid().ToString(), new string('a', 64));
+        Assert.True(result.TryGetValue(out var incomingEvent));
+        return incomingEvent.Delivery;
+    }
+
+    [Fact]
     public void Create_establishes_pending_event_and_delivery()
     {
         var endpointId = new WebhookEndpointId(Guid.NewGuid());

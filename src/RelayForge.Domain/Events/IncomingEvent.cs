@@ -10,7 +10,8 @@ namespace RelayForge.Domain.Events;
 public readonly record struct IncomingEventId(Guid Value) { public static IncomingEventId New() => new(Guid.NewGuid()); }
 public readonly record struct DeliveryId(Guid Value) { public static DeliveryId New() => new(Guid.NewGuid()); }
 public enum EventStatus { Pending }
-public enum DeliveryStatus { Pending }
+public enum DeliveryStatus { Pending, Processing, Delivered, RetryScheduled, DeadLettered, Replayed }
+public enum DeliveryAttemptOutcome { Delivered, Failed }
 
 public sealed class IncomingEvent
 {
@@ -53,7 +54,68 @@ public sealed class Delivery
     public WebhookEndpointId EndpointId { get; private set; }
     public DeliveryStatus Status { get; private set; }
     public DateTimeOffset CreatedAt { get; private set; }
+    public Guid? LeaseId { get; private set; }
+    public DateTimeOffset? LeaseExpiresAt { get; private set; }
+    public int AttemptCount { get; private set; }
+    public DateTimeOffset? NextAttemptAt { get; private set; }
+    public uint Version { get; private set; }
+    public IReadOnlyCollection<DeliveryAttempt> Attempts => _attempts;
+    private readonly List<DeliveryAttempt> _attempts = [];
     internal static Delivery Create(IncomingEventId eventId, WebhookEndpointId endpointId, DateTimeOffset createdAt) => new(DeliveryId.New(), eventId, endpointId, createdAt);
+
+    public DomainResult<Delivery> StartProcessing(Guid leaseId, DateTimeOffset expiresAt, DateTimeOffset now)
+    {
+        if (Status != DeliveryStatus.Pending || leaseId == Guid.Empty || expiresAt <= now) return InvalidTransition();
+        SetLease(leaseId, expiresAt); return DomainResult<Delivery>.Success(this);
+    }
+
+    public DomainResult<Delivery> RecoverExpiredLease(Guid leaseId, DateTimeOffset expiresAt, DateTimeOffset now)
+    {
+        if (Status != DeliveryStatus.Processing || LeaseExpiresAt is null || LeaseExpiresAt > now || leaseId == Guid.Empty || expiresAt <= now) return InvalidTransition();
+        SetLease(leaseId, expiresAt); return DomainResult<Delivery>.Success(this);
+    }
+
+    public DomainResult<Delivery> MarkDelivered(Guid leaseId, DateTimeOffset now) => Finish(leaseId, DeliveryStatus.Delivered, now);
+    public DomainResult<Delivery> ScheduleRetry(Guid leaseId, DateTimeOffset now) => Finish(leaseId, DeliveryStatus.RetryScheduled, now);
+
+    public DomainResult<Delivery> DeadLetter(Guid leaseId, DateTimeOffset now) => Finish(leaseId, DeliveryStatus.DeadLettered, now);
+
+    public DomainResult<Delivery> Replay(DateTimeOffset now)
+    {
+        if (Status != DeliveryStatus.DeadLettered) return InvalidTransition();
+        Status = DeliveryStatus.Replayed; NextAttemptAt = now; Version++; return DomainResult<Delivery>.Success(this);
+    }
+
+    private void SetLease(Guid leaseId, DateTimeOffset expiresAt)
+    { Status = DeliveryStatus.Processing; LeaseId = leaseId; LeaseExpiresAt = expiresAt; AttemptCount++; Version++; }
+
+    private DomainResult<Delivery> Finish(Guid leaseId, DeliveryStatus target, DateTimeOffset now)
+    {
+        if (Status != DeliveryStatus.Processing) return InvalidTransition();
+        if (LeaseId != leaseId) return DomainResult<Delivery>.Failure(new("delivery.lease_mismatch", "The delivery lease is no longer owned by this worker."));
+        Status = target; LeaseId = null; LeaseExpiresAt = null; NextAttemptAt = target == DeliveryStatus.RetryScheduled ? now : null; Version++;
+        return DomainResult<Delivery>.Success(this);
+    }
+
+    private static DomainResult<Delivery> InvalidTransition() => DomainResult<Delivery>.Failure(new("delivery.invalid_transition", "The requested delivery state transition is not allowed."));
+}
+
+public sealed class DeliveryAttempt
+{
+    private DeliveryAttempt() { }
+    private DeliveryAttempt(Guid id, DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error)
+    { Id = id; DeliveryId = deliveryId; Number = number; StartedAt = startedAt; CompletedAt = completedAt; DurationMilliseconds = Math.Max(0, (long)(completedAt - startedAt).TotalMilliseconds); Outcome = outcome; HttpStatusCode = statusCode; Error = Sanitize(error); }
+    public Guid Id { get; private set; }
+    public DeliveryId DeliveryId { get; private set; }
+    public int Number { get; private set; }
+    public DateTimeOffset StartedAt { get; private set; }
+    public DateTimeOffset CompletedAt { get; private set; }
+    public long DurationMilliseconds { get; private set; }
+    public DeliveryAttemptOutcome Outcome { get; private set; }
+    public int? HttpStatusCode { get; private set; }
+    public string? Error { get; private set; }
+    public static DeliveryAttempt Create(DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error) => new(Guid.NewGuid(), deliveryId, number, startedAt, completedAt, outcome, statusCode, error);
+    private static string? Sanitize(string? value) => string.IsNullOrWhiteSpace(value) ? null : new string(value.Where(c => !char.IsControl(c)).Take(1000).ToArray());
 }
 
 public static class EventFingerprint

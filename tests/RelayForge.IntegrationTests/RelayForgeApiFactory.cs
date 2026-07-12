@@ -25,6 +25,7 @@ public sealed class RelayForgeApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment(_environment);
         if (_connectionString is not null) builder.UseSetting("ConnectionStrings:RelayForge", _connectionString);
         builder.UseSetting("DataProtection:KeysPath", KeysPath);
+        builder.UseSetting("DeliveryWorker:Enabled", "false");
     }
 
     protected override void Dispose(bool disposing)
