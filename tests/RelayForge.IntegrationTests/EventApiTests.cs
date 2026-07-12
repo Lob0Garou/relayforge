@@ -12,6 +12,31 @@ namespace RelayForge.IntegrationTests;
 public sealed class EventApiTests(PostgreSqlFixture fixture)
 {
     [Fact]
+    public async Task Post_accepts_public_type_field()
+    {
+        await fixture.ResetAsync(); var endpointId = await CreateEndpointAsync(); using var client = fixture.Factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/events")
+        {
+            Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"type\":\"order.created\",\"payload\":{{\"a\":1}}}}", Encoding.UTF8, "application/json")
+        };
+        request.Headers.Add("Idempotency-Key", "public-type");
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Post_rejects_eventType_as_wire_field()
+    {
+        await fixture.ResetAsync(); var endpointId = await CreateEndpointAsync(); using var client = fixture.Factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"eventType\":\"order.created\",\"payload\":{{}}}}", Encoding.UTF8, "application/json") };
+        request.Headers.Add("Idempotency-Key", "legacy-field");
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ValidationProblemResponse>();
+        Assert.NotNull(problem); Assert.Contains("type", problem.Errors.Keys);
+    }
+
+    [Fact]
     public async Task Post_and_replays_are_atomic_and_idempotent()
     {
         await fixture.ResetAsync(); var endpointId = await CreateEndpointAsync();
@@ -90,8 +115,9 @@ public sealed class EventApiTests(PostgreSqlFixture fixture)
     }
 
     private async Task<Guid> CreateEndpointAsync() { using var client = fixture.Factory.CreateClient(); using var response = await client.PostAsJsonAsync("/api/endpoints", new { name="Events", url="https://example.com/hook", timeoutSeconds=30 }); response.EnsureSuccessStatusCode(); return (await response.Content.ReadFromJsonAsync<EndpointResponse>())!.Id; }
-    private static async Task<HttpResponseMessage> PostAsync(HttpClient client, string key, Guid endpointId, string eventType, string payload) { using var request = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"eventType\":{System.Text.Json.JsonSerializer.Serialize(eventType)},\"payload\":{payload}}}", Encoding.UTF8, "application/json") }; request.Headers.Add("Idempotency-Key", key); return await client.SendAsync(request); }
+    private static async Task<HttpResponseMessage> PostAsync(HttpClient client, string key, Guid endpointId, string eventType, string payload) { using var request = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"type\":{System.Text.Json.JsonSerializer.Serialize(eventType)},\"payload\":{payload}}}", Encoding.UTF8, "application/json") }; request.Headers.Add("Idempotency-Key", key); return await client.SendAsync(request); }
     private async Task AssertCountsAsync(int events, int deliveries) { await using var scope = fixture.Factory.Services.CreateAsyncScope(); var db = scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>(); Assert.Equal(events, await db.IncomingEvents.CountAsync()); Assert.Equal(deliveries, await db.Deliveries.CountAsync()); }
     private sealed record EndpointResponse(Guid Id);
     private sealed record EventResponse(Guid EventId, Guid DeliveryId, string State);
+    private sealed record ValidationProblemResponse(Dictionary<string, string[]> Errors);
 }

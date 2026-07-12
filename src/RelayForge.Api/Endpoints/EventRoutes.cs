@@ -30,12 +30,12 @@ public static class EventRoutes
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object || HasDuplicates(root)) return Validation("body", "Body must be valid JSON without duplicate properties.");
             body = new(root.TryGetProperty("endpointId", out var id) && id.TryGetGuid(out var guid) ? guid : Guid.Empty,
-                root.TryGetProperty("eventType", out var type) && type.ValueKind == JsonValueKind.String ? type.GetString() ?? "" : "",
+                root.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String ? type.GetString() ?? "" : "",
                 root.TryGetProperty("payload", out var payload) ? payload.GetRawText() : "");
         }
         catch (JsonException) { return Validation("body", "Body must be valid JSON without duplicate properties."); }
         if (body.EndpointId == Guid.Empty) return Validation("endpointId", "A valid endpointId is required.");
-        if (string.IsNullOrWhiteSpace(body.EventType) || body.EventType.Length > IncomingEvent.MaxEventTypeLength) return Validation("eventType", $"eventType is required and must not exceed {IncomingEvent.MaxEventTypeLength} characters.");
+        if (string.IsNullOrWhiteSpace(body.EventType) || body.EventType.Length > IncomingEvent.MaxEventTypeLength) return Validation("type", $"type is required and must not exceed {IncomingEvent.MaxEventTypeLength} characters.");
         if (Encoding.UTF8.GetByteCount(body.Payload) > MaxBodyBytes) return TypedResults.Problem(statusCode: 413, title: "Payload too large");
         var fingerprintResult = EventFingerprint.Create(new(body.EndpointId), body.EventType.Trim(), body.Payload);
         if (!fingerprintResult.TryGetValue(out var fingerprint)) return Validation("payload", fingerprintResult.Error.Description);
