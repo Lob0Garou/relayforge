@@ -36,11 +36,12 @@ public sealed class WebhookEndpointTests
     {
         var result = WebhookEndpoint.Create(" Orders ", "https://example.com/hooks", TimeSpan.FromSeconds(30), "protected");
         Assert.True(result.IsSuccess);
-        Assert.NotEqual(Guid.Empty, result.Value.Id.Value);
-        Assert.Equal("Orders", result.Value.Name);
-        Assert.Equal(new Uri("https://example.com/hooks"), result.Value.Url);
-        Assert.Equal(TimeSpan.FromSeconds(30), result.Value.Timeout);
-        Assert.True(result.Value.IsActive);
-        Assert.Equal("protected", result.Value.ProtectedSecret);
+        Assert.True(result.TryGetValue(out var endpoint));
+        Assert.NotEqual(Guid.Empty, endpoint.Id.Value);
+        Assert.Equal("Orders", endpoint.Name);
+        Assert.Equal(new Uri("https://example.com/hooks"), endpoint.Url);
+        Assert.Equal(TimeSpan.FromSeconds(30), endpoint.Timeout);
+        Assert.True(endpoint.IsActive);
+        Assert.Equal("protected", endpoint.ProtectedSecret);
     }
 }

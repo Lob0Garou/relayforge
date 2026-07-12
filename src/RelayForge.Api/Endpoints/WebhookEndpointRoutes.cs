@@ -29,14 +29,13 @@ public static class WebhookEndpointRoutes
         var secret = GenerateSecret();
         var protectedSecret = protectionProvider.CreateProtector("RelayForge.WebhookEndpointSecrets.v1").Protect(secret);
         var result = WebhookEndpoint.Create(request.Name, request.Url, TimeSpan.FromSeconds(request.TimeoutSeconds), protectedSecret);
-        if (!result.IsSuccess)
+        if (!result.TryGetValue(out var endpoint))
         {
             return TypedResults.ValidationProblem(new Dictionary<string, string[]> { [result.Error.Code] = [result.Error.Description] });
         }
 
-        db.WebhookEndpoints.Add(result.Value);
+        db.WebhookEndpoints.Add(endpoint);
         await db.SaveChangesAsync(cancellationToken);
-        var endpoint = result.Value;
         return TypedResults.Created($"/api/endpoints/{endpoint.Id.Value}", new CreatedEndpointResponse(
             endpoint.Id.Value, endpoint.Name, endpoint.Url.AbsoluteUri, (int)endpoint.Timeout.TotalSeconds, endpoint.IsActive, secret));
     }
@@ -52,9 +51,15 @@ public static class WebhookEndpointRoutes
             return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["pagination"] = [$"Page must be positive and pageSize must be between 1 and {MaxPageSize}."] });
         }
 
-        var query = db.WebhookEndpoints.OrderBy(endpoint => endpoint.CreatedAt);
+        var offset = ((long)page - 1) * pageSize;
+        if (offset > int.MaxValue)
+        {
+            return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["pagination"] = ["The requested page offset is too large."] });
+        }
+
+        var query = db.WebhookEndpoints.OrderBy(endpoint => endpoint.CreatedAt).ThenBy(endpoint => endpoint.Id);
         var totalCount = await query.CountAsync(cancellationToken);
-        var rows = await query.Skip((page - 1) * pageSize).Take(pageSize)
+        var rows = await query.Skip((int)offset).Take(pageSize)
             .Select(endpoint => new EndpointRow(endpoint.Id, endpoint.Name, endpoint.Url, endpoint.Timeout, endpoint.IsActive, endpoint.CreatedAt, endpoint.UpdatedAt))
             .ToListAsync(cancellationToken);
         var items = rows.Select(row => new EndpointItemResponse(row.Id.Value, row.Name, row.Url.AbsoluteUri,

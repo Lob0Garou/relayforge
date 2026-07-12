@@ -17,6 +17,18 @@ dotnet run --project src/RelayForge.Api
 
 The live health endpoint is available at `/health/live`.
 
+### Data Protection outside Development
+
+Production-like environments must mount a persistent keyring shared by all application instances and an X509 certificate/private key pair in PEM format. Configure these values through environment variables; never commit the certificate or private key:
+
+```powershell
+$env:DataProtection__KeysPath = 'C:\relayforge\keyring'
+$env:DataProtection__CertificatePath = 'C:\run\secrets\data-protection.crt.pem'
+$env:DataProtection__PrivateKeyPath = 'C:\run\secrets\data-protection.key.pem'
+```
+
+The local unprotected keyring fallback is enabled only in the `Development` environment.
+
 ## Planned capabilities
 
 - Idempotent event ingestion

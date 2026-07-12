@@ -14,12 +14,14 @@ public sealed class PostgreSqlCollection : ICollectionFixture<PostgreSqlFixture>
 public sealed class PostgreSqlFixture : IAsyncLifetime
 {
     private readonly PostgreSqlContainer _container = new PostgreSqlBuilder().WithImage("postgres:16-alpine").Build();
+    private readonly string _keysPath = Path.Combine(Path.GetTempPath(), "relayforge-tests", Guid.NewGuid().ToString("N"));
     public RelayForgeApiFactory Factory { get; private set; } = null!;
+    public string ConnectionString => _container.GetConnectionString();
 
     public async Task InitializeAsync()
     {
         await _container.StartAsync();
-        Factory = new RelayForgeApiFactory(_container.GetConnectionString());
+        Factory = new RelayForgeApiFactory(_container.GetConnectionString(), _keysPath);
         await using var scope = Factory.Services.CreateAsyncScope();
         await scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>().Database.MigrateAsync();
     }
@@ -34,5 +36,6 @@ public sealed class PostgreSqlFixture : IAsyncLifetime
     {
         await Factory.DisposeAsync();
         await _container.DisposeAsync();
+        if (Directory.Exists(_keysPath)) Directory.Delete(_keysPath, recursive: true);
     }
 }

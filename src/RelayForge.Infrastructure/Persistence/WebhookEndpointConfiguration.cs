@@ -22,6 +22,6 @@ internal sealed class WebhookEndpointConfiguration : IEntityTypeConfiguration<We
         builder.Property(endpoint => endpoint.ProtectedSecret).HasMaxLength(4096).IsRequired().HasColumnName("protected_secret");
         builder.Property(endpoint => endpoint.CreatedAt).HasColumnName("created_at");
         builder.Property(endpoint => endpoint.UpdatedAt).HasColumnName("updated_at");
-        builder.HasIndex(endpoint => new { endpoint.IsActive, endpoint.CreatedAt }).HasDatabaseName("ix_webhook_endpoints_active_created");
+        builder.HasIndex(endpoint => new { endpoint.CreatedAt, endpoint.Id }).HasDatabaseName("ix_webhook_endpoints_created_id");
     }
 }
