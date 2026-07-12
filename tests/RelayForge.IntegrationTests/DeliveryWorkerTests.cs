@@ -27,12 +27,24 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     [Fact]
     public async Task Two_concurrent_dispatchers_make_exactly_one_http_call()
     {
-        await fixture.ResetAsync(); await SeedAsync(); var repository = Repository(); var handler = new BlockingHandler();
-        var claims = await Task.WhenAll(repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default), repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
-        var leases = claims.SelectMany(x => x).ToArray(); Assert.Single(leases);
-        var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System);
-        var dispatches = leases.Select(x => dispatcher.DispatchAsync(x, default)).ToArray();
-        await handler.Entered.Task; Assert.Equal(1, handler.Calls); handler.Release.SetResult(); await Task.WhenAll(dispatches);
+        await fixture.ResetAsync(); await SeedAsync(); var handler = new BlockingHandler();
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bothStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var started = 0;
+        Task RunIndependentDispatcherAsync()
+        {
+            var repository = new DeliveryLeaseRepository(Factory(), TimeProvider.System);
+            var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System);
+            return RunAsync();
+            async Task RunAsync()
+            {
+                if (Interlocked.Increment(ref started) == 2) bothStarted.SetResult();
+                await start.Task;
+                foreach (var lease in await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default)) await dispatcher.DispatchAsync(lease, default);
+            }
+        }
+        var first = RunIndependentDispatcherAsync(); var second = RunIndependentDispatcherAsync();
+        await bothStarted.Task; start.SetResult(); await handler.Entered.Task;
+        Assert.Equal(1, handler.Calls); handler.Release.SetResult(); await Task.WhenAll(first, second);
     }
 
     [Fact]
@@ -151,6 +163,30 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
 
     [Fact]
+    public async Task Enabled_worker_gracefully_cancels_http_releases_lease_and_can_reclaim_after_replay()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var handler = new BlockingHandler();
+        await using var services = new ServiceCollection()
+            .AddSingleton(Factory()).AddSingleton(TimeProvider.System)
+            .AddSingleton<IDataProtectionProvider>(fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>())
+            .AddSingleton<IHttpClientFactory>(new SingleClientFactory(handler))
+            .AddScoped<DeliveryLeaseRepository>().AddScoped<DeliveryDispatcher>().BuildServiceProvider();
+        var worker = new DeliveryWorker(services.GetRequiredService<IServiceScopeFactory>(), Options.Create(new DeliveryWorkerOptions
+        { Enabled = true, BatchSize = 1, MaxConcurrency = 1, PollInterval = TimeSpan.FromMinutes(1), LeaseDuration = TimeSpan.FromMinutes(1) }));
+        await worker.StartAsync(default); await handler.Entered.Task;
+
+        await worker.StopAsync(default);
+
+        Assert.True(handler.Cancelled.Task.IsCompleted);
+        await using (var db = await Factory().CreateDbContextAsync())
+        {
+            var delivery = await db.Deliveries.SingleAsync(); Assert.Equal(DeliveryStatus.RetryScheduled, delivery.Status); Assert.Null(delivery.LeaseId);
+            await db.Database.ExecuteSqlRawAsync("UPDATE deliveries SET \"Status\" = 'Replayed'");
+        }
+        Assert.Single(await Repository().ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+    }
+
+    [Fact]
     public async Task Lease_transaction_is_committed_before_http_is_sent()
     {
         await fixture.ResetAsync(); await SeedAsync(); var repository = Repository();
@@ -186,8 +222,8 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
     private sealed class BlockingHandler : HttpMessageHandler
     {
-        public int Calls { get; private set; } public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { Calls++; Entered.SetResult(); await Release.Task.WaitAsync(cancellationToken); return new(HttpStatusCode.NoContent); }
+        public int Calls { get; private set; } public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Cancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { Calls++; Entered.TrySetResult(); try { await Release.Task.WaitAsync(cancellationToken); } catch (OperationCanceledException) { Cancelled.TrySetResult(); throw; } return new(HttpStatusCode.NoContent); }
     }
     private sealed class NetworkFailureHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => throw new HttpRequestException(HttpRequestError.ConnectionError, "unreachable"); }
     private sealed class NeverCompletesHandler : HttpMessageHandler { private readonly TaskCompletionSource _never = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { Entered.SetResult(); await _never.Task.WaitAsync(cancellationToken); throw new InvalidOperationException(); } }
