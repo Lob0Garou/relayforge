@@ -221,9 +221,42 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
         await fixture.ResetAsync(); await SeedAsync(); var repository = Repository(); var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
         var policy = new RelayForge.Domain.Retry.RetryPolicy(new(), new ThrowingJitter());
         var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(new RecordingHandler(HttpStatusCode.ServiceUnavailable)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System, policy);
-        await Assert.ThrowsAsync<InvalidOperationException>(() => dispatcher.DispatchAsync(lease, default));
+        var propagated = await Assert.ThrowsAsync<FinalizedDeliveryPolicyException>(() => dispatcher.DispatchAsync(lease, default));
+        Assert.IsType<InvalidOperationException>(propagated.InnerException);
         await using var db = await Factory().CreateDbContextAsync(); Assert.Equal(DeliveryStatus.DeadLettered, (await db.Deliveries.SingleAsync()).Status);
         Assert.Equal("processing_failure", Assert.Single(await db.DeliveryAttempts.ToListAsync()).Error);
+    }
+
+    [Fact]
+    public async Task Worker_isolates_finalized_policy_fault_and_delivers_sibling_and_next_poll()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); await SeedAsync();
+        var handler = new SequencedResponseHandler(HttpStatusCode.ServiceUnavailable, HttpStatusCode.NoContent, HttpStatusCode.NoContent);
+        var policy = new RelayForge.Domain.Retry.RetryPolicy(new(), new FirstThrowJitter());
+        await using var services = new ServiceCollection().AddSingleton(Factory()).AddSingleton(TimeProvider.System)
+            .AddSingleton<IDataProtectionProvider>(fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>()).AddSingleton<IHttpClientFactory>(new SingleClientFactory(handler))
+            .AddSingleton(policy).AddScoped<DeliveryLeaseRepository>().AddScoped<DeliveryDispatcher>().BuildServiceProvider();
+        var worker = new DeliveryWorker(services.GetRequiredService<IServiceScopeFactory>(), Options.Create(new DeliveryWorkerOptions { Enabled = true, BatchSize = 2, MaxConcurrency = 1, PollInterval = TimeSpan.FromMilliseconds(100), LeaseDuration = TimeSpan.FromMinutes(1) }));
+        await worker.StartAsync(default); await WaitForAttemptsAsync(2);
+        await SeedAsync(); await WaitForAttemptsAsync(3); await worker.StopAsync(default);
+        await using var db = await Factory().CreateDbContextAsync(); var deliveries = await db.Deliveries.OrderBy(x => x.CreatedAt).ToListAsync();
+        Assert.Single(deliveries, x => x.Status == DeliveryStatus.DeadLettered); Assert.Equal(2, deliveries.Count(x => x.Status == DeliveryStatus.Delivered));
+        Assert.Equal("processing_failure", Assert.Single(await db.DeliveryAttempts.Where(x => x.Outcome == DeliveryAttemptOutcome.Failed).ToListAsync()).Error);
+    }
+
+    [Fact]
+    public async Task Exhausted_sweep_is_bounded_by_batch_and_repeated_calls_drain_without_duplicates()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); await SeedAsync(); await SeedAsync();
+        await using (var setup = await Factory().CreateDbContextAsync()) await setup.Database.ExecuteSqlRawAsync("UPDATE deliveries SET \"Status\"='Processing', attempt_count=5, lease_id=gen_random_uuid(), lease_expires_at=clock_timestamp()-interval '1 second', version=5");
+        var repository = Repository();
+        for (var expected = 1; expected <= 3; expected++)
+        {
+            Assert.Empty(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+            await using var check = await Factory().CreateDbContextAsync(); Assert.Equal(expected, await check.Deliveries.CountAsync(x => x.Status == DeliveryStatus.DeadLettered)); Assert.Equal(expected, await check.DeliveryAttempts.CountAsync());
+        }
+        Assert.Empty(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await using var verify = await Factory().CreateDbContextAsync(); Assert.Equal(3, await verify.DeliveryAttempts.CountAsync());
     }
 
     [Fact]
@@ -417,4 +450,6 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
     private sealed class RetryAfterHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests); response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(120)); return Task.FromResult(response); } }
     private sealed class ThrowingJitter : RelayForge.Domain.Retry.IJitterSource { public double NextUnit() => throw new InvalidOperationException("policy defect details"); }
+    private sealed class FirstThrowJitter : RelayForge.Domain.Retry.IJitterSource { private int _calls; public double NextUnit() => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("sensitive policy details") : .5; }
+    private sealed class SequencedResponseHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
 }

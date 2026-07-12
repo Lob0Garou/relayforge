@@ -17,11 +17,14 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
         await using var db = await factory.CreateDbContextAsync(cancellationToken);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         await db.Database.ExecuteSqlInterpolatedAsync($"""
-            WITH db_now AS (SELECT clock_timestamp() AS value), exhausted AS (
+            WITH db_now AS (SELECT clock_timestamp() AS value), exhausted_candidates AS (
+              SELECT d."Id" FROM deliveries d, db_now n
+              WHERE d."Status" = 'Processing' AND d.lease_expires_at <= n.value AND d.attempt_count >= {maxAttempts}
+              ORDER BY d.lease_expires_at, d."CreatedAt" FOR UPDATE SKIP LOCKED LIMIT {batchSize}
+            ), exhausted AS (
               UPDATE deliveries d SET "Status" = 'DeadLettered', lease_id = NULL, lease_expires_at = NULL,
                 next_attempt_at = NULL, version = version + 1
-              FROM db_now n WHERE d."Status" = 'Processing' AND d.lease_expires_at <= n.value
-                AND d.attempt_count >= {maxAttempts}
+              FROM db_now n, exhausted_candidates c WHERE d."Id" = c."Id"
               RETURNING d."Id", d.attempt_count, n.value
             )
             INSERT INTO delivery_attempts ("Id", "DeliveryId", "Number", "StartedAt", "CompletedAt", "DurationMilliseconds", "Outcome", "HttpStatusCode", "Error")

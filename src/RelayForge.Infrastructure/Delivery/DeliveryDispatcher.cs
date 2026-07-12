@@ -6,6 +6,11 @@ using RelayForge.Domain.Retry;
 
 namespace RelayForge.Infrastructure.Delivery;
 
+public sealed class FinalizedDeliveryPolicyException(Guid deliveryId, Exception innerException) : Exception("delivery_policy_failure", innerException)
+{
+    public Guid DeliveryId { get; } = deliveryId;
+}
+
 public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttpClientFactory clients, IDataProtectionProvider protection, TimeProvider clock, RetryPolicy? retryPolicy = null)
 {
     public async Task DispatchAsync(DeliveryLease lease, CancellationToken cancellationToken)
@@ -45,9 +50,10 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
     private async Task<RetryDecision> DecideAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, DeliveryFailure failure, string? retryAfter)
     {
         try { return (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(failure, lease.AttemptNumber, retryAfter, clock.GetUtcNow()); }
-        catch
+        catch (Exception exception)
         {
-            await repository.FinalizeAsync(lease, startedAt, statusCode, "processing_failure", new RetryDecision.DeadLetter("processing_failure"), CancellationToken.None);
+            var finalized = await repository.FinalizeAsync(lease, startedAt, statusCode, "processing_failure", new RetryDecision.DeadLetter("processing_failure"), CancellationToken.None);
+            if (finalized) throw new FinalizedDeliveryPolicyException(lease.DeliveryId, exception);
             throw;
         }
     }
