@@ -4,7 +4,7 @@ using Microsoft.Extensions.Options;
 
 namespace RelayForge.Infrastructure.Delivery;
 
-public sealed class DeliveryWorkerOptions { public bool Enabled { get; set; } = true; public int BatchSize { get; set; } = 10; public int MaxConcurrency { get; set; } = 4; public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(1); public TimeSpan LeaseDuration { get; set; } = TimeSpan.FromMinutes(2); }
+public sealed class DeliveryWorkerOptions { public bool Enabled { get; set; } = true; public int BatchSize { get; set; } = 10; public int MaxConcurrency { get; set; } = 4; public int MaxAttempts { get; set; } = RelayForge.Domain.Retry.RetryPolicyOptions.DefaultMaxAttempts; public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(1); public TimeSpan LeaseDuration { get; set; } = TimeSpan.FromMinutes(2); }
 
 public sealed class DeliveryWorker(IServiceScopeFactory scopes, IOptions<DeliveryWorkerOptions> options) : BackgroundService
 {
@@ -16,7 +16,7 @@ public sealed class DeliveryWorker(IServiceScopeFactory scopes, IOptions<Deliver
         {
             await using var scope = scopes.CreateAsyncScope();
             var repository = scope.ServiceProvider.GetRequiredService<DeliveryLeaseRepository>();
-            var leases = await repository.ClaimAsync(settings.BatchSize, settings.LeaseDuration, stoppingToken);
+            var leases = await repository.ClaimAsync(settings.BatchSize, settings.LeaseDuration, stoppingToken, settings.MaxAttempts);
             try
             {
                 await Parallel.ForEachAsync(leases, new ParallelOptions { MaxDegreeOfParallelism = settings.MaxConcurrency, CancellationToken = stoppingToken },
@@ -24,7 +24,7 @@ public sealed class DeliveryWorker(IServiceScopeFactory scopes, IOptions<Deliver
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                foreach (var lease in leases) await repository.ReleaseAsync(lease, null, "worker_stopped", CancellationToken.None);
+                foreach (var lease in leases) await repository.ReleaseUnstartedAsync(lease, "worker_stopped_before_dispatch", CancellationToken.None);
                 throw;
             }
         } while (await timer.WaitForNextTickAsync(stoppingToken));

@@ -73,6 +73,17 @@ public sealed class RetryPolicyTests
         Assert.Equal(TimeSpan.FromSeconds(30), Assert.IsType<RetryDecision.Retry>(Policy().Decide(failure, 1, now.AddHours(1).ToString("R"), now)).Delay);
     }
 
+    [Theory]
+    [InlineData("9223372036854775807")]
+    [InlineData("9223372036854775806")]
+    [InlineData("10675199")]
+    public void Extreme_retry_after_delta_never_throws_and_is_capped(string header)
+    {
+        var exception = Record.Exception(() => Policy().Decide(DeliveryFailureClassifier.FromHttpStatus(429), 1, header, DateTimeOffset.UnixEpoch));
+        Assert.Null(exception);
+        Assert.Equal(TimeSpan.FromSeconds(30), Assert.IsType<RetryDecision.Retry>(Policy().Decide(DeliveryFailureClassifier.FromHttpStatus(429), 1, header, DateTimeOffset.UnixEpoch)).Delay);
+    }
+
     private static RetryPolicy Policy(double jitter = .5) => new(new RetryPolicyOptions(5, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), .5), new FixedJitter(jitter));
     private sealed class FixedJitter(double value) : IJitterSource { public double NextUnit() => value; }
 }

@@ -31,14 +31,24 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
         catch (OperationCanceledException)
         {
             var cancelled = DeliveryFailureClassifier.Cancelled();
-            var cancellationDecision = (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(cancelled, lease.AttemptNumber, null, clock.GetUtcNow());
+            var cancellationDecision = await DecideAsync(lease, startedAt, null, cancelled, null);
             await repository.FinalizeAsync(lease, startedAt, null, cancelled.ReasonCode, cancellationDecision, CancellationToken.None);
             throw;
         }
         catch (HttpRequestException) { failure = DeliveryFailureClassifier.Network(); }
         catch (Exception) { failure = DeliveryFailureClassifier.Processing(); }
-        var decision = failure.Kind == DeliveryFailureKind.Success ? null : (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(failure, lease.AttemptNumber, retryAfter, clock.GetUtcNow());
+        var decision = failure.Kind == DeliveryFailureKind.Success ? null : await DecideAsync(lease, startedAt, status, failure, retryAfter);
         var reasonCode = decision is RetryDecision.DeadLetter deadLetter ? deadLetter.ReasonCode : failure.ReasonCode;
         await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken);
+    }
+
+    private async Task<RetryDecision> DecideAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, DeliveryFailure failure, string? retryAfter)
+    {
+        try { return (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(failure, lease.AttemptNumber, retryAfter, clock.GetUtcNow()); }
+        catch
+        {
+            await repository.FinalizeAsync(lease, startedAt, statusCode, "processing_failure", new RetryDecision.DeadLetter("processing_failure"), CancellationToken.None);
+            throw;
+        }
     }
 }

@@ -36,6 +36,7 @@ public sealed class SystemJitterSource : IJitterSource
 /// <summary>Retry policy counts attempts, not retries. The default permits five total attempts.</summary>
 public sealed record RetryPolicyOptions(int MaxAttempts = 5, TimeSpan BaseDelay = default, TimeSpan MaxDelay = default, double JitterRatio = .2)
 {
+    public const int DefaultMaxAttempts = 5;
     public TimeSpan EffectiveBaseDelay => BaseDelay == default ? TimeSpan.FromSeconds(2) : BaseDelay;
     public TimeSpan EffectiveMaxDelay => MaxDelay == default ? TimeSpan.FromMinutes(5) : MaxDelay;
 }
@@ -54,19 +55,22 @@ public sealed class RetryPolicy(RetryPolicyOptions options, IJitterSource jitter
         var unit = Math.Clamp(jitter.NextUnit(), 0, 1);
         var factor = 1 - options.JitterRatio + (2 * options.JitterRatio * unit);
         var delay = TimeSpan.FromTicks((long)Math.Min(capped.Ticks * factor, max.Ticks));
-        if (TryParseRetryAfter(retryAfter, now, out var requested)) delay = requested > max ? max : requested;
+        if (TryParseRetryAfter(retryAfter, now, max, out var requested)) delay = requested;
         return new RetryDecision.Retry(delay);
     }
 
     // Negative delta-seconds are invalid and fall back to the policy backoff. A valid past HTTP-date means retry now.
-    private static bool TryParseRetryAfter(string? value, DateTimeOffset now, out TimeSpan delay)
+    private static bool TryParseRetryAfter(string? value, DateTimeOffset now, TimeSpan maxDelay, out TimeSpan delay)
     {
         delay = default;
         if (string.IsNullOrWhiteSpace(value)) return false;
         if (long.TryParse(value.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
-        { delay = TimeSpan.FromSeconds(seconds); return true; }
+        {
+            delay = seconds >= Math.Ceiling(maxDelay.TotalSeconds) ? maxDelay : TimeSpan.FromSeconds(seconds);
+            return true;
+        }
         if (DateTimeOffset.TryParseExact(value.Trim(), "R", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
-        { delay = date <= now ? TimeSpan.Zero : date - now; return true; }
+        { var requested = date <= now ? TimeSpan.Zero : date - now; delay = requested > maxDelay ? maxDelay : requested; return true; }
         return false;
     }
 }

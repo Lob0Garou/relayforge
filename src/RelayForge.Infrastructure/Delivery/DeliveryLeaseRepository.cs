@@ -10,18 +10,30 @@ public interface IDeliveryClaimObserver { Task SnapshotCapturedAsync(Cancellatio
 
 public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContext> factory, TimeProvider? processClock = null, IDeliveryClaimObserver? observer = null)
 {
-    public async Task<IReadOnlyList<DeliveryLease>> ClaimAsync(int batchSize, TimeSpan leaseDuration, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<DeliveryLease>> ClaimAsync(int batchSize, TimeSpan leaseDuration, CancellationToken cancellationToken, int maxAttempts = RetryPolicyOptions.DefaultMaxAttempts)
     {
         _ = processClock; // Accepted for DI/test skew; lease authority remains PostgreSQL.
         var leaseId = Guid.NewGuid();
         await using var db = await factory.CreateDbContextAsync(cancellationToken);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH db_now AS (SELECT clock_timestamp() AS value), exhausted AS (
+              UPDATE deliveries d SET "Status" = 'DeadLettered', lease_id = NULL, lease_expires_at = NULL,
+                next_attempt_at = NULL, version = version + 1
+              FROM db_now n WHERE d."Status" = 'Processing' AND d.lease_expires_at <= n.value
+                AND d.attempt_count >= {maxAttempts}
+              RETURNING d."Id", d.attempt_count, n.value
+            )
+            INSERT INTO delivery_attempts ("Id", "DeliveryId", "Number", "StartedAt", "CompletedAt", "DurationMilliseconds", "Outcome", "HttpStatusCode", "Error")
+            SELECT gen_random_uuid(), "Id", attempt_count, value, value, 0, 'Failed', NULL, 'lease_expired_at_attempt_limit'
+            FROM exhausted ON CONFLICT ("DeliveryId", "Number") DO NOTHING
+            """, cancellationToken);
         var rows = await db.Database.SqlQuery<DeliveryLeaseRow>($"""
             WITH candidates AS (
               SELECT "Id" FROM deliveries
-              WHERE "Status" IN ('Pending', 'Replayed')
+              WHERE attempt_count < {maxAttempts} AND ("Status" IN ('Pending', 'Replayed')
                  OR ("Status" = 'RetryScheduled' AND next_attempt_at <= clock_timestamp())
-                 OR ("Status" = 'Processing' AND lease_expires_at <= clock_timestamp())
+                 OR ("Status" = 'Processing' AND lease_expires_at <= clock_timestamp()))
               ORDER BY "CreatedAt" FOR UPDATE SKIP LOCKED LIMIT {batchSize}
             ), claimed AS (
               UPDATE deliveries d SET "Status" = 'Processing', lease_id = {leaseId},
@@ -80,6 +92,9 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
         if (attemptStartedAt is { } startedAt) { db.DeliveryAttempts.Add(DeliveryAttempt.Create(deliveryId, lease.AttemptNumber, startedAt, completed[0], DeliveryAttemptOutcome.Failed, null, reason)); await db.SaveChangesAsync(cancellationToken); }
         await transaction.CommitAsync(cancellationToken); return true;
     }
+
+    public Task<bool> ReleaseUnstartedAsync(DeliveryLease lease, string reasonCode, CancellationToken cancellationToken) =>
+        ReleaseAsync(lease, null, reasonCode, cancellationToken);
 
     private sealed record DeliveryLeaseRow(Guid DeliveryId, Guid LeaseId, uint FencingToken, DateTimeOffset LeaseExpiresAt, int AttemptNumber, string Payload, string Url, int TimeoutSeconds, string ProtectedSecret);
 }

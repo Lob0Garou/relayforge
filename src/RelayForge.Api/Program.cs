@@ -20,10 +20,11 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
 builder.Services.AddSingleton<IJitterSource, SystemJitterSource>();
-builder.Services.AddSingleton(sp => new RetryPolicy(new RetryPolicyOptions(), sp.GetRequiredService<IJitterSource>()));
+builder.Services.AddSingleton(sp => new RetryPolicy(new RetryPolicyOptions(sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<DeliveryWorkerOptions>>().Value.MaxAttempts), sp.GetRequiredService<IJitterSource>()));
 builder.Services.AddOptions<DeliveryWorkerOptions>().Bind(builder.Configuration.GetSection("DeliveryWorker"))
     .Validate(x => x.BatchSize is >= 1 and <= 100, "BatchSize must be between 1 and 100.")
     .Validate(x => x.MaxConcurrency is >= 1 and <= 64, "MaxConcurrency must be between 1 and 64.")
+    .Validate(x => x.MaxAttempts is >= 1 and <= 100, "MaxAttempts must be between 1 and 100.")
     .Validate(x => x.PollInterval >= TimeSpan.FromMilliseconds(100) && x.PollInterval <= TimeSpan.FromMinutes(5), "PollInterval is out of range.")
     .Validate(x => x.LeaseDuration >= TimeSpan.FromSeconds(5) && x.LeaseDuration <= TimeSpan.FromMinutes(30), "LeaseDuration is out of range.")
     .ValidateOnStart();

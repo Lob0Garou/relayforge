@@ -201,6 +201,32 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
 
     [Fact]
+    public async Task Expired_fifth_attempt_is_dead_lettered_once_and_never_claimed_as_sixth_attempt()
+    {
+        await fixture.ResetAsync(); await SeedAsync();
+        await using (var setup = await Factory().CreateDbContextAsync())
+            await setup.Database.ExecuteSqlRawAsync("UPDATE deliveries SET \"Status\"='Processing', attempt_count=5, lease_id=gen_random_uuid(), lease_expires_at=clock_timestamp()-interval '1 second', version=5");
+        var first = Repository(); var second = Repository();
+        var claims = await Task.WhenAll(first.ClaimAsync(1, TimeSpan.FromMinutes(1), default), second.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        Assert.All(claims, Assert.Empty);
+        Assert.Empty(await first.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await using var db = await Factory().CreateDbContextAsync(); var delivery = await db.Deliveries.SingleAsync(); var attempt = Assert.Single(await db.DeliveryAttempts.ToListAsync());
+        Assert.Equal(DeliveryStatus.DeadLettered, delivery.Status); Assert.Equal(5, delivery.AttemptCount);
+        Assert.Equal(5, attempt.Number); Assert.Equal("lease_expired_at_attempt_limit", attempt.Error);
+    }
+
+    [Fact]
+    public async Task Unexpected_policy_failure_dead_letters_sanitized_attempt_before_propagating()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var repository = Repository(); var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        var policy = new RelayForge.Domain.Retry.RetryPolicy(new(), new ThrowingJitter());
+        var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(new RecordingHandler(HttpStatusCode.ServiceUnavailable)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System, policy);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => dispatcher.DispatchAsync(lease, default));
+        await using var db = await Factory().CreateDbContextAsync(); Assert.Equal(DeliveryStatus.DeadLettered, (await db.Deliveries.SingleAsync()).Status);
+        Assert.Equal("processing_failure", Assert.Single(await db.DeliveryAttempts.ToListAsync()).Error);
+    }
+
+    [Fact]
     public async Task Disabled_worker_does_not_claim_pending_delivery()
     {
         await fixture.ResetAsync(); await SeedAsync();
@@ -390,4 +416,5 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private sealed class FirstThrowsHandler : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("secret details") : Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent)); }
     private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
     private sealed class RetryAfterHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests); response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(120)); return Task.FromResult(response); } }
+    private sealed class ThrowingJitter : RelayForge.Domain.Retry.IJitterSource { public double NextUnit() => throw new InvalidOperationException("policy defect details"); }
 }
