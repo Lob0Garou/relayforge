@@ -4,6 +4,10 @@
 
 `POST /api/events` uses a single-tenant, globally unique `Idempotency-Key` in the MVP. Replays with the same endpoint, event type, and semantically equivalent JSON payload return the original event and delivery IDs. Reusing the key for any different endpoint, event type, or payload returns `409 Conflict`.
 
+JSON numbers are canonicalized exactly; equivalent spellings share a fingerprint, and negative zero is intentionally equivalent to zero.
+
+Endpoint activity is checked under a PostgreSQL `FOR SHARE` row lock in the same transaction that creates the event and delivery. Any future endpoint-deactivation path must first acquire `FOR UPDATE` (or another incompatible row lock) in its update transaction so ingestion and deactivation have a single database-defined order.
+
 Reliable webhook delivery and replay platform built with .NET 8 and React.
 
 RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.

@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using RelayForge.Domain.Events;
 using RelayForge.Infrastructure.Persistence;
+using Npgsql;
 
 namespace RelayForge.IntegrationTests;
 
@@ -96,11 +97,25 @@ public sealed class EventApiTests(PostgreSqlFixture fixture)
     {
         await fixture.ResetAsync(); var endpointId = await CreateEndpointAsync(); using var client = fixture.Factory.CreateClient();
         using var missing = await client.PostAsJsonAsync("/api/events", new { endpointId, eventType = "x", payload = new { a = 1 } }); Assert.Equal(HttpStatusCode.BadRequest, missing.StatusCode);
-        using var duplicate = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"eventType\":\"x\",\"payload\":{{\"a\":1,\"a\":2}}}}", Encoding.UTF8, "application/json") }; duplicate.Headers.Add("Idempotency-Key", "dup");
+        using var duplicate = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"type\":\"x\",\"payload\":{{\"a\":1,\"a\":2}}}}", Encoding.UTF8, "application/json") }; duplicate.Headers.Add("Idempotency-Key", "dup");
         using var duplicateResponse = await client.SendAsync(duplicate); Assert.Equal(HttpStatusCode.BadRequest, duplicateResponse.StatusCode);
+        var duplicateProblem = await duplicateResponse.Content.ReadFromJsonAsync<ValidationProblemResponse>(); Assert.NotNull(duplicateProblem); Assert.Contains("body", duplicateProblem.Errors.Keys);
         using var unknown = await PostAsync(client, "unknown", Guid.NewGuid(), "x", "{}"); Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
         await using (var scope = fixture.Factory.Services.CreateAsyncScope()) await scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>().Database.ExecuteSqlInterpolatedAsync($"UPDATE webhook_endpoints SET is_active = false WHERE id = {endpointId}");
         using var inactive = await PostAsync(client, "inactive", endpointId, "x", "{}"); Assert.Equal(HttpStatusCode.Conflict, inactive.StatusCode);
+    }
+
+    [Fact]
+    public async Task Ingestion_waits_for_concurrent_deactivation_and_does_not_insert_after_it_commits()
+    {
+        await fixture.ResetAsync(); var endpointId = await CreateEndpointAsync();
+        await using var blocker = new NpgsqlConnection(fixture.ConnectionString); await blocker.OpenAsync(); await using var transaction = await blocker.BeginTransactionAsync();
+        await using (var command = new NpgsqlCommand("SELECT id FROM webhook_endpoints WHERE id = @id FOR UPDATE", blocker, transaction)) { command.Parameters.AddWithValue("id", endpointId); Assert.Equal(endpointId, await command.ExecuteScalarAsync()); }
+        await using (var command = new NpgsqlCommand("UPDATE webhook_endpoints SET is_active = false WHERE id = @id", blocker, transaction)) { command.Parameters.AddWithValue("id", endpointId); Assert.Equal(1, await command.ExecuteNonQueryAsync()); }
+        using var client = fixture.Factory.CreateClient(); var responseTask = PostAsync(client, "locked-deactivation", endpointId, "x", "{}");
+        await WaitForShareLockAsync(); Assert.False(responseTask.IsCompleted);
+        await transaction.CommitAsync(); using var response = await responseTask;
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode); await AssertCountsAsync(0, 0);
     }
 
     [Fact]
@@ -117,6 +132,17 @@ public sealed class EventApiTests(PostgreSqlFixture fixture)
     private async Task<Guid> CreateEndpointAsync() { using var client = fixture.Factory.CreateClient(); using var response = await client.PostAsJsonAsync("/api/endpoints", new { name="Events", url="https://example.com/hook", timeoutSeconds=30 }); response.EnsureSuccessStatusCode(); return (await response.Content.ReadFromJsonAsync<EndpointResponse>())!.Id; }
     private static async Task<HttpResponseMessage> PostAsync(HttpClient client, string key, Guid endpointId, string eventType, string payload) { using var request = new HttpRequestMessage(HttpMethod.Post, "/api/events") { Content = new StringContent($"{{\"endpointId\":\"{endpointId}\",\"type\":{System.Text.Json.JsonSerializer.Serialize(eventType)},\"payload\":{payload}}}", Encoding.UTF8, "application/json") }; request.Headers.Add("Idempotency-Key", key); return await client.SendAsync(request); }
     private async Task AssertCountsAsync(int events, int deliveries) { await using var scope = fixture.Factory.Services.CreateAsyncScope(); var db = scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>(); Assert.Equal(events, await db.IncomingEvents.CountAsync()); Assert.Equal(deliveries, await db.Deliveries.CountAsync()); }
+    private async Task WaitForShareLockAsync()
+    {
+        await using var observer = new NpgsqlConnection(fixture.ConnectionString); await observer.OpenAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (true)
+        {
+            await using var command = new NpgsqlCommand("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR SHARE%')", observer);
+            if ((bool)(await command.ExecuteScalarAsync(timeout.Token))!) return;
+            await Task.Yield(); timeout.Token.ThrowIfCancellationRequested();
+        }
+    }
     private sealed record EndpointResponse(Guid Id);
     private sealed record EventResponse(Guid EventId, Guid DeliveryId, string State);
     private sealed record ValidationProblemResponse(Dictionary<string, string[]> Errors);

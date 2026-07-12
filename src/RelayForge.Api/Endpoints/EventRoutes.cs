@@ -42,16 +42,28 @@ public static class EventRoutes
         var canonicalPayload = EventFingerprint.Canonicalize(body.Payload);
         var existing = await db.IncomingEvents.AsNoTracking().Include(x => x.Delivery).SingleOrDefaultAsync(x => x.IdempotencyKey == key, cancellationToken);
         if (existing is not null) return Existing(existing, fingerprint);
-        var endpoint = await db.WebhookEndpoints.AsNoTracking().Where(x => x.Id == new WebhookEndpointId(body.EndpointId)).Select(x => new { x.IsActive }).SingleOrDefaultAsync(cancellationToken);
-        if (endpoint is null) return TypedResults.Problem(statusCode: 404, title: "Endpoint not found");
-        if (!endpoint.IsActive) return TypedResults.Problem(statusCode: 409, title: "Endpoint is inactive");
         var creation = IncomingEvent.Create(new(body.EndpointId), body.EventType, canonicalPayload, key, fingerprint);
         if (!creation.TryGetValue(out var incomingEvent)) return Validation(creation.Error.Code, creation.Error.Description);
         try
         {
             var strategy = db.Database.CreateExecutionStrategy();
-            await strategy.ExecuteAsync(async () => { await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken); db.IncomingEvents.Add(incomingEvent); await db.SaveChangesAsync(cancellationToken); await transaction.CommitAsync(cancellationToken); });
-            return Accepted(incomingEvent);
+            var outcome = await strategy.ExecuteAsync(async () =>
+            {
+                await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+                var endpoint = await db.WebhookEndpoints
+                    .FromSqlInterpolated($"SELECT * FROM webhook_endpoints WHERE id = {body.EndpointId} FOR SHARE")
+                    .AsNoTracking().SingleOrDefaultAsync(cancellationToken);
+                if (endpoint is null) return IngestionOutcome.EndpointNotFound;
+                if (!endpoint.IsActive) return IngestionOutcome.EndpointInactive;
+                db.IncomingEvents.Add(incomingEvent); await db.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken); return IngestionOutcome.Accepted;
+            });
+            return outcome switch
+            {
+                IngestionOutcome.EndpointNotFound => TypedResults.Problem(statusCode: 404, title: "Endpoint not found"),
+                IngestionOutcome.EndpointInactive => TypedResults.Problem(statusCode: 409, title: "Endpoint is inactive"),
+                _ => Accepted(incomingEvent)
+            };
         }
         catch (DbUpdateException exception) when (exception.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "ux_incoming_events_idempotency_key" })
         {
@@ -68,4 +80,5 @@ public static class EventRoutes
     private static IResult Validation(string key, string message) => TypedResults.ValidationProblem(new Dictionary<string, string[]> { [key] = [message] });
     private sealed record EventRequest(Guid EndpointId, string EventType, string Payload);
     private sealed record EventResponse(Guid EventId, Guid DeliveryId, string State);
+    private enum IngestionOutcome { Accepted, EndpointNotFound, EndpointInactive }
 }
