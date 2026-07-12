@@ -37,11 +37,31 @@ $env:DataProtection__PrivateKeyPath = 'C:\run\secrets\data-protection.key.pem'
 
 The local unprotected keyring fallback is enabled only in the `Development` environment.
 
+## Webhook signature protocol and failure simulator
+
+RelayForge webhook signatures use HMAC-SHA256. The signed bytes are exactly the UTF-8 bytes of
+`{unixTimestamp}.{deliveryId}.` followed by the raw request body bytes, with no JSON parsing or
+canonicalization. The signature header is lowercase `sha256=<hex>`. Binding the timestamp and
+delivery ID to the exact payload detects mutation and limits replay; receivers must enforce a
+timestamp window and compare signatures in constant time.
+
+The standalone simulator can be run locally with its clearly synthetic Development secret:
+
+```powershell
+dotnet run --project src/RelayForge.UnstableReceiver
+```
+
+Configure its bounded failure scenario with `PUT /operations/scenario`, send signed raw bodies to
+`POST /webhooks/relayforge`, and inspect attempts at `GET /operations/deliveries/{deliveryId}`.
+For any non-Development environment set `Receiver__SigningSecret` through configuration or the
+environment. The simulator's state is deliberately thread-safe but in-memory and process-local: it
+is a demo receiver, not a broker, durable queue, or delivery source of truth.
+
 ## Planned capabilities
 
 - Idempotent event ingestion
 - Durable at-least-once delivery
-- HMAC signatures
+- Outbound HMAC signing in the delivery worker
 - Retries with exponential backoff and jitter
 - Dead-letter queue and manual replay
 - Operational dashboard and OpenTelemetry
