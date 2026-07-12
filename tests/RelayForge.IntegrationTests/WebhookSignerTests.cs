@@ -5,7 +5,7 @@ namespace RelayForge.IntegrationTests;
 
 public sealed class WebhookSignerTests
 {
-    private const string DeliveryId = "018d2f54-31ec-7d8a-a7da-4f9ed11c2e21";
+    private static readonly Guid DeliveryId = Guid.ParseExact("018d2f54-31ec-7d8a-a7da-4f9ed11c2e21", "D");
     private static readonly byte[] Secret = "test-secret"u8.ToArray();
     private static readonly byte[] Payload = "{\"orderId\":42}"u8.ToArray();
 
@@ -26,7 +26,7 @@ public sealed class WebhookSignerTests
         var time = new FrozenTimeProvider(DateTimeOffset.FromUnixTimeSeconds(1_700_000_000));
         var signature = WebhookSigner.Sign(Secret, 1_700_000_000, DeliveryId, Payload);
         var payload = changedField == "payload" ? "{\"orderId\":43}"u8.ToArray() : Payload;
-        var deliveryId = changedField == "deliveryId" ? $"{DeliveryId}-changed" : DeliveryId;
+        var deliveryId = changedField == "deliveryId" ? Guid.Parse("118d2f54-31ec-7d8a-a7da-4f9ed11c2e21") : DeliveryId;
         var timestamp = changedField == "timestamp" ? 1_700_000_001 : 1_700_000_000;
 
         Assert.False(WebhookSigner.Verify(Secret, timestamp, deliveryId, payload, signature, TimeSpan.FromMinutes(5), time));
@@ -41,6 +41,27 @@ public sealed class WebhookSignerTests
         var signature = WebhookSigner.Sign(Secret, timestamp, DeliveryId, Payload);
 
         Assert.False(WebhookSigner.Verify(Secret, timestamp, DeliveryId, Payload, signature, TimeSpan.FromMinutes(5), time));
+    }
+
+    [Theory]
+    [InlineData(1_699_999_700)]
+    [InlineData(1_700_000_300)]
+    public void Verify_accepts_timestamp_at_inclusive_tolerance_boundary(long timestamp)
+    {
+        var time = new FrozenTimeProvider(DateTimeOffset.FromUnixTimeSeconds(1_700_000_000));
+        var signature = WebhookSigner.Sign(Secret, timestamp, DeliveryId, Payload);
+
+        Assert.True(WebhookSigner.Verify(Secret, timestamp, DeliveryId, Payload, signature, TimeSpan.FromMinutes(5), time));
+    }
+
+    [Fact]
+    public void Verify_rejects_empty_secret_and_negative_tolerance()
+    {
+        var time = new FrozenTimeProvider(DateTimeOffset.FromUnixTimeSeconds(1_700_000_000));
+        var signature = WebhookSigner.Sign(Secret, 1_700_000_000, DeliveryId, Payload);
+
+        Assert.False(WebhookSigner.Verify([], 1_700_000_000, DeliveryId, Payload, signature, TimeSpan.FromMinutes(5), time));
+        Assert.False(WebhookSigner.Verify(Secret, 1_700_000_000, DeliveryId, Payload, signature, TimeSpan.FromTicks(-1), time));
     }
 
     [Theory]

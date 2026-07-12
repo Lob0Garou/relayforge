@@ -19,7 +19,7 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     public async Task Valid_signed_webhook_is_accepted()
     {
         await ConfigureScenarioAsync(0);
-        var response = await SendWebhookAsync(Guid.NewGuid().ToString(), "{\"ok\":true}");
+        var response = await SendWebhookAsync(Guid.NewGuid(), "{\"ok\":true}");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
@@ -27,7 +27,7 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     [Fact]
     public async Task Wrong_signature_is_unauthorized()
     {
-        var request = CreateRequest(Guid.NewGuid().ToString(), "{}", "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        var request = CreateRequest(Guid.NewGuid(), "{}"u8.ToArray(), "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         var response = await _client.SendAsync(request);
 
@@ -37,10 +37,10 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     [Fact]
     public async Task Invalid_timestamp_is_unauthorized()
     {
-        var deliveryId = Guid.NewGuid().ToString();
-        var payload = "{}";
+        var deliveryId = Guid.NewGuid();
+        var payload = "{}"u8.ToArray();
         var staleTimestamp = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds();
-        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), staleTimestamp, deliveryId, Encoding.UTF8.GetBytes(payload));
+        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), staleTimestamp, deliveryId, payload);
         var request = CreateRequest(deliveryId, payload, signature, staleTimestamp);
 
         var response = await _client.SendAsync(request);
@@ -51,7 +51,7 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     [Fact]
     public async Task Configured_receiver_fails_n_times_then_succeeds_and_reports_state()
     {
-        var deliveryId = Guid.NewGuid().ToString();
+        var deliveryId = Guid.NewGuid();
         var configured = await ConfigureScenarioAsync(2);
 
         var first = await SendWebhookAsync(deliveryId, "{\"attempt\":1}");
@@ -67,10 +67,106 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
         Assert.Equal(2, state?.FailuresBeforeSuccess);
     }
 
-    private Task<HttpResponseMessage> SendWebhookAsync(string deliveryId, string payload)
+    [Theory]
+    [InlineData("a./b")]
+    [InlineData("a/.b")]
+    [InlineData("{018d2f54-31ec-7d8a-a7da-4f9ed11c2e21}")]
+    [InlineData("018D2F54-31EC-7D8A-A7DA-4F9ED11C2E21")]
+    public async Task Noncanonical_or_ambiguous_delivery_id_is_unauthorized(string deliveryId)
+    {
+        var request = CreateRawIdRequest(deliveryId, "{}"u8.ToArray());
+
+        var response = await _client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Duplicate_required_header_is_unauthorized()
+    {
+        var request = CreateRequest(Guid.NewGuid(), "{}"u8.ToArray(), "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        request.Headers.Add("RelayForge-Signature", "sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        var response = await _client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Reconfiguring_scenario_atomically_resets_attempt_counters()
+    {
+        var deliveryId = Guid.NewGuid();
+        await ConfigureScenarioAsync(1);
+        await SendWebhookAsync(deliveryId, "{}");
+
+        await ConfigureScenarioAsync(0);
+        var oldState = await _client.GetAsync($"/operations/deliveries/{deliveryId:D}");
+        var next = await SendWebhookAsync(deliveryId, "{}");
+
+        Assert.Equal(HttpStatusCode.NotFound, oldState.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, next.StatusCode);
+    }
+
+    [Fact]
+    public async Task Invalid_scenario_is_bad_request()
+    {
+        var response = await _client.PutAsJsonAsync("/operations/scenario", new
+        {
+            failuresBeforeSuccess = 101,
+            failureStatusCode = 399,
+            delayMilliseconds = 30_001
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Body_at_limit_is_accepted_and_content_length_over_limit_is_rejected()
+    {
+        await ConfigureScenarioAsync(0);
+        var accepted = await SendWebhookAsync(Guid.NewGuid(), new byte[65_536]);
+        var rejected = await SendWebhookAsync(Guid.NewGuid(), new byte[65_537]);
+
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected.StatusCode);
+    }
+
+    [Fact]
+    public async Task Chunked_body_over_limit_is_rejected()
+    {
+        await ConfigureScenarioAsync(0);
+        var deliveryId = Guid.NewGuid();
+        var payload = new byte[65_537];
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), timestamp, deliveryId, payload);
+        var request = CreateRequest(deliveryId, payload, signature, timestamp);
+        request.Content = new StreamingContent(payload);
+
+        var response = await _client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Concurrent_attempts_are_counted_without_loss()
+    {
+        await ConfigureScenarioAsync(100);
+        var deliveryId = Guid.NewGuid();
+
+        var responses = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => SendWebhookAsync(deliveryId, "{}")));
+        var state = await _client.GetFromJsonAsync<ReceiverState>($"/operations/deliveries/{deliveryId:D}");
+
+        Assert.All(responses, response => Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode));
+        Assert.Equal(20, state?.Attempts);
+    }
+
+    private Task<HttpResponseMessage> SendWebhookAsync(Guid deliveryId, string payload) =>
+        SendWebhookAsync(deliveryId, Encoding.UTF8.GetBytes(payload));
+
+    private Task<HttpResponseMessage> SendWebhookAsync(Guid deliveryId, byte[] payload)
     {
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), timestamp, deliveryId, Encoding.UTF8.GetBytes(payload));
+        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), timestamp, deliveryId, payload);
         return _client.SendAsync(CreateRequest(deliveryId, payload, signature, timestamp));
     }
 
@@ -82,19 +178,39 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
             delayMilliseconds = 0
         });
 
-    private static HttpRequestMessage CreateRequest(string deliveryId, string payload, string signature, long? timestamp = null)
+    private static HttpRequestMessage CreateRequest(Guid deliveryId, byte[] payload, string signature, long? timestamp = null)
     {
         var request = new HttpRequestMessage(HttpMethod.Post, "/webhooks/relayforge")
         {
-            Content = new StringContent(payload, Encoding.UTF8, "application/json")
+            Content = new ByteArrayContent(payload)
         };
-        request.Headers.Add("RelayForge-Delivery-Id", deliveryId);
+        request.Headers.Add("RelayForge-Delivery-Id", deliveryId.ToString("D"));
         request.Headers.Add("RelayForge-Timestamp", (timestamp ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds()).ToString(System.Globalization.CultureInfo.InvariantCulture));
         request.Headers.Add("RelayForge-Signature", signature);
         return request;
     }
 
+    private static HttpRequestMessage CreateRawIdRequest(string deliveryId, byte[] payload)
+    {
+        var request = CreateRequest(Guid.Empty, payload, "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        request.Headers.Remove("RelayForge-Delivery-Id");
+        request.Headers.Add("RelayForge-Delivery-Id", deliveryId);
+        return request;
+    }
+
     private sealed record ReceiverState(int Attempts, int FailuresBeforeSuccess);
+
+    private sealed class StreamingContent(byte[] payload) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            stream.WriteAsync(payload).AsTask();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
 }
 
 public sealed class UnstableReceiverFactory : WebApplicationFactory<RelayForge.UnstableReceiver.Program>

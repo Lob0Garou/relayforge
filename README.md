@@ -41,9 +41,10 @@ The local unprotected keyring fallback is enabled only in the `Development` envi
 
 RelayForge webhook signatures use HMAC-SHA256. The signed bytes are exactly the UTF-8 bytes of
 `{unixTimestamp}.{deliveryId}.` followed by the raw request body bytes, with no JSON parsing or
-canonicalization. The signature header is lowercase `sha256=<hex>`. Binding the timestamp and
-delivery ID to the exact payload detects mutation and limits replay; receivers must enforce a
-timestamp window and compare signatures in constant time.
+canonicalization. Delivery IDs use canonical lowercase GUID `D` format, making the dot-delimited
+frame unambiguous. The signature header is lowercase `sha256=<hex>`. Binding the timestamp and
+delivery ID to the exact payload detects mutation and, together with an enforced timestamp window,
+limits replay but does not prevent it. Receivers compare signatures in constant time.
 
 The standalone simulator can be run locally with its clearly synthetic Development secret:
 
@@ -51,7 +52,9 @@ The standalone simulator can be run locally with its clearly synthetic Developme
 dotnet run --project src/RelayForge.UnstableReceiver
 ```
 
-Configure its bounded failure scenario with `PUT /operations/scenario`, send signed raw bodies to
+Configure its bounded failure scenario with `PUT /operations/scenario`; each reconfiguration
+atomically clears the prior attempt counters. Status codes 400-599 are intentionally accepted so
+the simulator can model both terminal and transient failures. Send signed raw bodies to
 `POST /webhooks/relayforge`, and inspect attempts at `GET /operations/deliveries/{deliveryId}`.
 For any non-Development environment set `Receiver__SigningSecret` through configuration or the
 environment. The simulator's state is deliberately thread-safe but in-memory and process-local: it

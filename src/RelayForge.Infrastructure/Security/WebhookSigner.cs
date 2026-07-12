@@ -7,7 +7,8 @@ namespace RelayForge.Infrastructure.Security;
 /// <summary>
 /// Signs RelayForge webhook deliveries. The protocol frame is the exact UTF-8 bytes of
 /// <c>{unixTimestamp}.{deliveryId}.</c> followed immediately by the unmodified payload bytes.
-/// The delivery id and timestamp bind a payload to one delivery attempt context and prevent replay.
+/// The delivery id uses lowercase canonical <c>D</c> format. Timestamp and id bind the payload to
+/// one delivery context; enforcing the timestamp window limits replay but does not prevent it.
 /// </summary>
 public static class WebhookSigner
 {
@@ -17,10 +18,9 @@ public static class WebhookSigner
     public static string Sign(
         ReadOnlySpan<byte> secret,
         long unixTimestamp,
-        string deliveryId,
+        Guid deliveryId,
         ReadOnlySpan<byte> payload)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(deliveryId);
         if (secret.IsEmpty)
         {
             throw new ArgumentException("Signing secret cannot be empty.", nameof(secret));
@@ -33,14 +33,14 @@ public static class WebhookSigner
     public static bool Verify(
         ReadOnlySpan<byte> secret,
         long unixTimestamp,
-        string deliveryId,
+        Guid deliveryId,
         ReadOnlySpan<byte> payload,
         string signature,
         TimeSpan timestampTolerance,
         TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(timeProvider);
-        if (secret.IsEmpty || string.IsNullOrWhiteSpace(deliveryId) || timestampTolerance < TimeSpan.Zero)
+        if (secret.IsEmpty || timestampTolerance < TimeSpan.Zero)
         {
             return false;
         }
@@ -85,13 +85,13 @@ public static class WebhookSigner
     private static byte[] ComputeHash(
         ReadOnlySpan<byte> secret,
         long unixTimestamp,
-        string deliveryId,
+        Guid deliveryId,
         ReadOnlySpan<byte> payload)
     {
         using var hmac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, secret);
         var framePrefix = Encoding.UTF8.GetBytes(string.Create(
             CultureInfo.InvariantCulture,
-            $"{unixTimestamp}.{deliveryId}."));
+            $"{unixTimestamp}.{deliveryId:D}."));
         hmac.AppendData(framePrefix);
         hmac.AppendData(payload);
         return hmac.GetHashAndReset();

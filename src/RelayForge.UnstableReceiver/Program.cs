@@ -13,11 +13,20 @@ builder.Services.AddOptions<ReceiverOptions>()
     .Validate(options => options.TimestampToleranceSeconds is > 0 and <= 3_600, "Timestamp tolerance must be from 1 to 3600 seconds.")
     .Validate(options => options.MaxBodyBytes is > 0 and <= 1_048_576, "Maximum body size must be from 1 to 1048576 bytes.")
     .ValidateOnStart();
+builder.Services.AddSingleton(serviceProvider =>
+{
+    var options = serviceProvider.GetRequiredService<IOptions<ReceiverOptions>>().Value;
+    return new ReceiverSigningConfiguration(
+        Encoding.UTF8.GetBytes(options.SigningSecret),
+        TimeSpan.FromSeconds(options.TimestampToleranceSeconds),
+        options.MaxBodyBytes);
+});
 
 var app = builder.Build();
 
 app.MapPut("/operations/scenario", (ReceiverScenario scenario, ReceiverSimulator simulator) =>
 {
+    // Any 4xx or 5xx is intentional: demos may model terminal or transient receiver failures.
     if (scenario.FailuresBeforeSuccess is < 0 or > 100 ||
         scenario.FailureStatusCode is < 400 or > 599 ||
         scenario.DelayMilliseconds is < 0 or > 30_000)
@@ -33,17 +42,19 @@ app.MapPut("/operations/scenario", (ReceiverScenario scenario, ReceiverSimulator
 });
 
 app.MapGet("/operations/deliveries/{deliveryId}", (string deliveryId, ReceiverSimulator simulator) =>
-    simulator.GetState(deliveryId) is { } state ? Results.Ok(state) : Results.NotFound());
+    TryParseCanonicalDeliveryId(deliveryId, out var parsedDeliveryId) && simulator.GetState(parsedDeliveryId) is { } state
+        ? Results.Ok(state)
+        : Results.NotFound());
 
 app.MapPost("/webhooks/relayforge", async (
     HttpRequest request,
     ReceiverSimulator simulator,
-    IOptions<ReceiverOptions> configuredOptions,
+    ReceiverSigningConfiguration signingConfiguration,
     TimeProvider timeProvider,
     CancellationToken cancellationToken) =>
 {
-    var options = configuredOptions.Value;
     if (!TryGetSingleHeader(request, "RelayForge-Delivery-Id", out var deliveryId) ||
+        !TryParseCanonicalDeliveryId(deliveryId, out var parsedDeliveryId) ||
         !TryGetSingleHeader(request, "RelayForge-Timestamp", out var timestampText) ||
         !long.TryParse(timestampText, NumberStyles.None, CultureInfo.InvariantCulture, out var timestamp) ||
         !TryGetSingleHeader(request, "RelayForge-Signature", out var signature))
@@ -51,26 +62,26 @@ app.MapPost("/webhooks/relayforge", async (
         return Results.Unauthorized();
     }
 
-    var payload = await ReadBodyAsync(request, options.MaxBodyBytes, cancellationToken);
+    var payload = await ReadBodyAsync(request, signingConfiguration.MaxBodyBytes, cancellationToken);
     if (payload is null)
     {
         return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
     }
 
     var valid = WebhookSigner.Verify(
-        Encoding.UTF8.GetBytes(options.SigningSecret),
+        signingConfiguration.Secret.Span,
         timestamp,
-        deliveryId,
+        parsedDeliveryId,
         payload,
         signature,
-        TimeSpan.FromSeconds(options.TimestampToleranceSeconds),
+        signingConfiguration.TimestampTolerance,
         timeProvider);
     if (!valid)
     {
         return Results.Unauthorized();
     }
 
-    var state = simulator.RecordAttempt(deliveryId);
+    var state = simulator.RecordAttempt(parsedDeliveryId);
     if (state.DelayMilliseconds > 0)
     {
         await Task.Delay(TimeSpan.FromMilliseconds(state.DelayMilliseconds), timeProvider, cancellationToken);
@@ -95,6 +106,10 @@ static bool TryGetSingleHeader(HttpRequest request, string name, out string valu
     value = string.Empty;
     return false;
 }
+
+static bool TryParseCanonicalDeliveryId(string value, out Guid deliveryId) =>
+    Guid.TryParseExact(value, "D", out deliveryId) &&
+    string.Equals(value, deliveryId.ToString("D"), StringComparison.Ordinal);
 
 static async Task<byte[]?> ReadBodyAsync(HttpRequest request, int maximumBytes, CancellationToken cancellationToken)
 {

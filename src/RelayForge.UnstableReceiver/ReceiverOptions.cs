@@ -10,3 +10,8 @@ public sealed class ReceiverOptions
 
     public int MaxBodyBytes { get; init; } = 65_536;
 }
+
+public sealed record ReceiverSigningConfiguration(
+    ReadOnlyMemory<byte> Secret,
+    TimeSpan TimestampTolerance,
+    int MaxBodyBytes);
