@@ -30,7 +30,9 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { failure = DeliveryFailureClassifier.Timeout(); }
         catch (OperationCanceledException)
         {
-            await repository.ReleaseAsync(lease, startedAt, "worker_cancelled", CancellationToken.None);
+            var cancelled = DeliveryFailureClassifier.Cancelled();
+            var cancellationDecision = (retryPolicy ?? new RetryPolicy(new(), new SystemJitterSource())).Decide(cancelled, lease.AttemptNumber, null, clock.GetUtcNow());
+            await repository.FinalizeAsync(lease, startedAt, null, cancelled.ReasonCode, cancellationDecision, CancellationToken.None);
             throw;
         }
         catch (HttpRequestException) { failure = DeliveryFailureClassifier.Network(); }

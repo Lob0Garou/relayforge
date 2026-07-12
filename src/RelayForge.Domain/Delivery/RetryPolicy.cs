@@ -15,6 +15,7 @@ public static class DeliveryFailureClassifier
     };
     public static DeliveryFailure Timeout() => new(DeliveryFailureKind.Transient, "timeout");
     public static DeliveryFailure Network() => new(DeliveryFailureKind.Transient, "network");
+    public static DeliveryFailure Cancelled() => new(DeliveryFailureKind.Transient, "delivery_cancelled");
     public static DeliveryFailure Processing() => new(DeliveryFailureKind.Permanent, "processing_failure");
 }
 
@@ -57,14 +58,15 @@ public sealed class RetryPolicy(RetryPolicyOptions options, IJitterSource jitter
         return new RetryDecision.Retry(delay);
     }
 
+    // Negative delta-seconds are invalid and fall back to the policy backoff. A valid past HTTP-date means retry now.
     private static bool TryParseRetryAfter(string? value, DateTimeOffset now, out TimeSpan delay)
     {
         delay = default;
         if (string.IsNullOrWhiteSpace(value)) return false;
         if (long.TryParse(value.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
         { delay = TimeSpan.FromSeconds(seconds); return true; }
-        if (DateTimeOffset.TryParseExact(value.Trim(), "R", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date) && date >= now)
-        { delay = date - now; return true; }
+        if (DateTimeOffset.TryParseExact(value.Trim(), "R", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
+        { delay = date <= now ? TimeSpan.Zero : date - now; return true; }
         return false;
     }
 }

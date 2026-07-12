@@ -64,6 +64,15 @@ public sealed class RetryPolicyTests
         Assert.IsType<RetryDecision.DeadLetter>(Policy().Decide(DeliveryFailureClassifier.FromHttpStatus(400), 1, "20", now));
     }
 
+    [Fact]
+    public void Retry_after_past_http_date_means_immediate_retry_and_future_date_is_capped()
+    {
+        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+        var failure = DeliveryFailureClassifier.FromHttpStatus(429);
+        Assert.Equal(TimeSpan.Zero, Assert.IsType<RetryDecision.Retry>(Policy().Decide(failure, 1, now.AddMinutes(-1).ToString("R"), now)).Delay);
+        Assert.Equal(TimeSpan.FromSeconds(30), Assert.IsType<RetryDecision.Retry>(Policy().Decide(failure, 1, now.AddHours(1).ToString("R"), now)).Delay);
+    }
+
     private static RetryPolicy Policy(double jitter = .5) => new(new RetryPolicyOptions(5, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), .5), new FixedJitter(jitter));
     private sealed class FixedJitter(double value) : IJitterSource { public double NextUnit() => value; }
 }

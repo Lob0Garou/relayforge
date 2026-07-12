@@ -180,6 +180,26 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
         await AssertFailedOnceAsync();
     }
 
+    [Theory]
+    [InlineData(1, DeliveryStatus.RetryScheduled)]
+    [InlineData(5, DeliveryStatus.DeadLettered)]
+    public async Task Cancellation_uses_retry_policy_and_fifth_attempt_cannot_be_claimed_again(int attemptNumber, DeliveryStatus expected)
+    {
+        await fixture.ResetAsync(); await SeedAsync();
+        if (attemptNumber == 5)
+        {
+            await using var setup = await Factory().CreateDbContextAsync();
+            await setup.Database.ExecuteSqlRawAsync("UPDATE deliveries SET \"Status\" = 'RetryScheduled', attempt_count = 4, next_attempt_at = clock_timestamp() - interval '1 second'");
+        }
+        var repository = Repository(); var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        var handler = new BlockingHandler(); using var cancellation = new CancellationTokenSource();
+        var dispatch = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System).DispatchAsync(lease, cancellation.Token);
+        await handler.Entered.Task; cancellation.Cancel(); await Assert.ThrowsAnyAsync<OperationCanceledException>(() => dispatch);
+        await using var db = await Factory().CreateDbContextAsync(); var delivery = await db.Deliveries.SingleAsync(); var recorded = Assert.Single(await db.DeliveryAttempts.ToListAsync());
+        Assert.Equal(expected, delivery.Status); Assert.Equal(attemptNumber, recorded.Number); Assert.Equal("delivery_cancelled", recorded.Error);
+        if (attemptNumber == 5) Assert.Empty(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+    }
+
     [Fact]
     public async Task Disabled_worker_does_not_claim_pending_delivery()
     {
