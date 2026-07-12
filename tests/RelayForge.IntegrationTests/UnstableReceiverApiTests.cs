@@ -68,13 +68,13 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     }
 
     [Theory]
-    [InlineData("a./b")]
-    [InlineData("a/.b")]
-    [InlineData("{018d2f54-31ec-7d8a-a7da-4f9ed11c2e21}")]
-    [InlineData("018D2F54-31EC-7D8A-A7DA-4F9ED11C2E21")]
-    public async Task Noncanonical_or_ambiguous_delivery_id_is_unauthorized(string deliveryId)
+    [InlineData("a./b", "00000000-0000-0000-0000-000000000000")]
+    [InlineData("a/.b", "00000000-0000-0000-0000-000000000000")]
+    [InlineData("{018d2f54-31ec-7d8a-a7da-4f9ed11c2e21}", "018d2f54-31ec-7d8a-a7da-4f9ed11c2e21")]
+    [InlineData("018D2F54-31EC-7D8A-A7DA-4F9ED11C2E21", "018d2f54-31ec-7d8a-a7da-4f9ed11c2e21")]
+    public async Task Noncanonical_or_ambiguous_delivery_id_is_unauthorized(string deliveryId, string underlyingDeliveryId)
     {
-        var request = CreateRawIdRequest(deliveryId, "{}"u8.ToArray());
+        var request = CreateRawIdRequest(deliveryId, Guid.ParseExact(underlyingDeliveryId, "D"), "{}"u8.ToArray());
 
         var response = await _client.SendAsync(request);
 
@@ -84,7 +84,11 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     [Fact]
     public async Task Duplicate_required_header_is_unauthorized()
     {
-        var request = CreateRequest(Guid.NewGuid(), "{}"u8.ToArray(), "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        var deliveryId = Guid.NewGuid();
+        var payload = "{}"u8.ToArray();
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var validSignature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), timestamp, deliveryId, payload);
+        var request = CreateRequest(deliveryId, payload, validSignature, timestamp);
         request.Headers.Add("RelayForge-Signature", "sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
         var response = await _client.SendAsync(request);
@@ -190,9 +194,11 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
         return request;
     }
 
-    private static HttpRequestMessage CreateRawIdRequest(string deliveryId, byte[] payload)
+    private static HttpRequestMessage CreateRawIdRequest(string deliveryId, Guid underlyingDeliveryId, byte[] payload)
     {
-        var request = CreateRequest(Guid.Empty, payload, "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(Secret), timestamp, underlyingDeliveryId, payload);
+        var request = CreateRequest(underlyingDeliveryId, payload, signature, timestamp);
         request.Headers.Remove("RelayForge-Delivery-Id");
         request.Headers.Add("RelayForge-Delivery-Id", deliveryId);
         return request;
