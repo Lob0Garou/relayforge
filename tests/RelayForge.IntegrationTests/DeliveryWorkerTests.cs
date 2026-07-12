@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Hosting;
 using RelayForge.Domain.Endpoints;
 using RelayForge.Domain.Events;
 using RelayForge.Infrastructure.Delivery;
@@ -15,6 +16,32 @@ namespace RelayForge.IntegrationTests;
 [Collection(PostgreSqlCollection.Name)]
 public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
 {
+    [Fact]
+    public async Task Claim_snapshot_stays_bound_to_original_lease_while_competitor_skips_locked_row()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); var observer = new BlockingClaimObserver();
+        var firstRepository = new DeliveryLeaseRepository(Factory(), TimeProvider.System, observer);
+        var firstTask = firstRepository.ClaimAsync(1, TimeSpan.FromMinutes(1), default);
+        await observer.Captured.Task;
+        var competitor = await new DeliveryLeaseRepository(Factory(), TimeProvider.System).ClaimAsync(1, TimeSpan.FromMinutes(1), default);
+        Assert.Empty(competitor);
+        observer.Release.SetResult(); var first = Assert.Single(await firstTask);
+        await using var db = await Factory().CreateDbContextAsync(); var stored = await db.Deliveries.SingleAsync();
+        Assert.Equal(stored.LeaseId, first.LeaseId); Assert.Equal(stored.Version, first.FencingToken);
+    }
+
+    [Fact]
+    public async Task Process_clock_skew_cannot_steal_live_lease_or_finalize_database_expired_lease()
+    {
+        await fixture.ResetAsync(); await SeedAsync();
+        var future = new DeliveryLeaseRepository(Factory(), new FixedTimeProvider(DateTimeOffset.MaxValue.AddDays(-1)));
+        var past = new DeliveryLeaseRepository(Factory(), new FixedTimeProvider(DateTimeOffset.MinValue.AddDays(1)));
+        var original = Assert.Single(await future.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        Assert.Empty(await past.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await using (var db = await Factory().CreateDbContextAsync()) await db.Database.ExecuteSqlRawAsync("UPDATE deliveries SET lease_expires_at = clock_timestamp() - interval '1 second'");
+        var recovered = Assert.Single(await past.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        Assert.NotEqual(original.LeaseId, recovered.LeaseId); Assert.False(await future.FinalizeAsync(original, DateTimeOffset.UtcNow, 200, null, default));
+    }
     [Fact]
     public async Task Concurrent_claimers_receive_one_delivery_once()
     {
@@ -187,6 +214,63 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
 
     [Fact]
+    public async Task Poison_delivery_is_sanitized_while_healthy_delivery_succeeds_in_same_worker_batch()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); await SeedAsync();
+        await using (var db = await Factory().CreateDbContextAsync()) await db.Database.ExecuteSqlRawAsync("UPDATE webhook_endpoints SET protected_secret = 'invalid' WHERE id = (SELECT id FROM webhook_endpoints ORDER BY created_at LIMIT 1)");
+        var handler = new RecordingHandler(HttpStatusCode.NoContent);
+        await using var services = new ServiceCollection().AddSingleton(Factory()).AddSingleton(TimeProvider.System)
+            .AddSingleton<IDataProtectionProvider>(fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>()).AddSingleton<IHttpClientFactory>(new SingleClientFactory(handler))
+            .AddScoped<DeliveryLeaseRepository>().AddScoped<DeliveryDispatcher>().BuildServiceProvider();
+        var worker = new DeliveryWorker(services.GetRequiredService<IServiceScopeFactory>(), Options.Create(new DeliveryWorkerOptions { Enabled = true, BatchSize = 2, MaxConcurrency = 2, PollInterval = TimeSpan.FromMinutes(1), LeaseDuration = TimeSpan.FromMinutes(1) }));
+        await worker.StartAsync(default); await WaitForAttemptsAsync(2); await worker.StopAsync(default);
+        await using var verify = await Factory().CreateDbContextAsync(); var attempts = await verify.DeliveryAttempts.OrderBy(x => x.Outcome).ToListAsync();
+        Assert.Equal(2, attempts.Count); Assert.Contains(attempts, x => x.Outcome == DeliveryAttemptOutcome.Delivered);
+        var poison = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("Delivery processing failed.", poison.Error); Assert.Equal(1, handler.Calls);
+    }
+
+    [Fact]
+    public async Task Unexpected_handler_exception_is_sanitized_and_does_not_block_healthy_sibling()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); await SeedAsync(); var repository = Repository();
+        var leases = await repository.ClaimAsync(2, TimeSpan.FromMinutes(1), default); Assert.Equal(2, leases.Count);
+        var handler = new FirstThrowsHandler(); var dispatcher = new DeliveryDispatcher(repository, new SingleClientFactory(handler), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System);
+        await Task.WhenAll(leases.Select(x => dispatcher.DispatchAsync(x, default)));
+        await using var db = await Factory().CreateDbContextAsync(); var attempts = await db.DeliveryAttempts.ToListAsync();
+        Assert.Contains(attempts, x => x.Outcome == DeliveryAttemptOutcome.Delivered); var failed = Assert.Single(attempts, x => x.Outcome == DeliveryAttemptOutcome.Failed); Assert.Equal("Delivery processing failed.", failed.Error);
+    }
+
+    [Fact]
+    public async Task Polling_indexes_exist_and_are_selected_for_ready_and_expired_queries()
+    {
+        await fixture.ResetAsync(); await SeedAsync(); await using var db = await Factory().CreateDbContextAsync();
+        var definitions = await db.Database.SqlQuery<string>($"SELECT indexdef AS \"Value\" FROM pg_indexes WHERE tablename = 'deliveries' AND indexname IN ('ix_deliveries_ready','ix_deliveries_expired_leases')").ToListAsync();
+        Assert.Equal(2, definitions.Count); Assert.Contains(definitions, x => x.Contains("Pending", StringComparison.Ordinal) && x.Contains("Replayed", StringComparison.Ordinal)); Assert.Contains(definitions, x => x.Contains("lease_expires_at", StringComparison.Ordinal));
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TEMP TABLE synthetic_deliveries(event_id uuid, delivery_id uuid, ordinal integer);
+            INSERT INTO synthetic_deliveries SELECT gen_random_uuid(), gen_random_uuid(), n FROM generate_series(1, 500) n;
+            INSERT INTO incoming_events ("Id", "EndpointId", "EventType", "Payload", "IdempotencyKey", "Fingerprint", "Status", "CreatedAt")
+              SELECT event_id, (SELECT id FROM webhook_endpoints LIMIT 1), 'synthetic', '{{}}'::jsonb, 'synthetic-' || ordinal, repeat('a',64), 'Pending', clock_timestamp() - ordinal * interval '1 second' FROM synthetic_deliveries;
+            INSERT INTO deliveries ("Id", "EventId", "EndpointId", "Status", "CreatedAt", attempt_count, version, lease_expires_at)
+              SELECT delivery_id, event_id, (SELECT id FROM webhook_endpoints LIMIT 1), CASE WHEN ordinal % 2 = 0 THEN 'Pending' ELSE 'Processing' END,
+                clock_timestamp() - ordinal * interval '1 second', 0, 0, CASE WHEN ordinal % 2 = 1 THEN clock_timestamp() - interval '1 minute' END FROM synthetic_deliveries;
+            """);
+        await db.Database.ExecuteSqlRawAsync("SET enable_seqscan = off");
+        var readyPlan = await db.Database.SqlQuery<string>($"EXPLAIN SELECT \"Id\" FROM deliveries WHERE \"Status\" IN ('Pending','Replayed') ORDER BY \"Status\", \"CreatedAt\" LIMIT 10").ToListAsync();
+        var expiredPlan = await db.Database.SqlQuery<string>($"EXPLAIN SELECT \"Id\" FROM deliveries WHERE \"Status\" = 'Processing' AND lease_expires_at <= clock_timestamp() ORDER BY lease_expires_at, \"CreatedAt\" LIMIT 10").ToListAsync();
+        Assert.Contains(readyPlan, x => x.Contains("ix_deliveries_ready", StringComparison.Ordinal)); Assert.Contains(expiredPlan, x => x.Contains("ix_deliveries_expired_leases", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Invalid_worker_options_fail_validation_on_start()
+    {
+        var services = new ServiceCollection(); services.AddOptions<DeliveryWorkerOptions>().Configure(x => x.BatchSize = 0)
+            .Validate(x => x.BatchSize is >= 1 and <= 100, "invalid").ValidateOnStart();
+        using var provider = services.BuildServiceProvider();
+        Assert.Throws<OptionsValidationException>(() => provider.GetRequiredService<IStartupValidator>().Validate());
+    }
+
+    [Fact]
     public async Task Lease_transaction_is_committed_before_http_is_sent()
     {
         await fixture.ResetAsync(); await SeedAsync(); var repository = Repository();
@@ -204,6 +288,11 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private async Task AssertFailedOnceAsync()
     {
         await using var db = await Factory().CreateDbContextAsync(); Assert.Equal(DeliveryStatus.RetryScheduled, (await db.Deliveries.SingleAsync()).Status); Assert.Single(await db.DeliveryAttempts.ToListAsync());
+    }
+    private async Task WaitForAttemptsAsync(int count)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (true) { await using var db = await Factory().CreateDbContextAsync(timeout.Token); if (await db.DeliveryAttempts.CountAsync(timeout.Token) == count) return; await Task.Yield(); timeout.Token.ThrowIfCancellationRequested(); }
     }
     private async Task<string> SeedAsync(TimeSpan? timeout = null)
     {
@@ -227,4 +316,7 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
     private sealed class NetworkFailureHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => throw new HttpRequestException(HttpRequestError.ConnectionError, "unreachable"); }
     private sealed class NeverCompletesHandler : HttpMessageHandler { private readonly TaskCompletionSource _never = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { Entered.SetResult(); await _never.Task.WaitAsync(cancellationToken); throw new InvalidOperationException(); } }
+    private sealed class BlockingClaimObserver : IDeliveryClaimObserver { public TaskCompletionSource Captured { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously); public async Task SnapshotCapturedAsync(CancellationToken cancellationToken) { Captured.SetResult(); await Release.Task.WaitAsync(cancellationToken); } }
+    private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider { public override DateTimeOffset GetUtcNow() => value; }
+    private sealed class FirstThrowsHandler : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("secret details") : Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent)); }
 }

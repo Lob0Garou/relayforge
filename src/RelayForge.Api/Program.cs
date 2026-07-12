@@ -18,7 +18,12 @@ builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
-builder.Services.Configure<DeliveryWorkerOptions>(builder.Configuration.GetSection("DeliveryWorker"));
+builder.Services.AddOptions<DeliveryWorkerOptions>().Bind(builder.Configuration.GetSection("DeliveryWorker"))
+    .Validate(x => x.BatchSize is >= 1 and <= 100, "BatchSize must be between 1 and 100.")
+    .Validate(x => x.MaxConcurrency is >= 1 and <= 64, "MaxConcurrency must be between 1 and 64.")
+    .Validate(x => x.PollInterval >= TimeSpan.FromMilliseconds(100) && x.PollInterval <= TimeSpan.FromMinutes(5), "PollInterval is out of range.")
+    .Validate(x => x.LeaseDuration >= TimeSpan.FromSeconds(5) && x.LeaseDuration <= TimeSpan.FromMinutes(30), "LeaseDuration is out of range.")
+    .ValidateOnStart();
 builder.Services.AddHttpClient("RelayForgeDelivery").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 builder.Services.AddHostedService<DeliveryWorker>();
 

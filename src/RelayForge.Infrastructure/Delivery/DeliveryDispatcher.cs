@@ -32,6 +32,7 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             throw;
         }
         catch (HttpRequestException exception) { error = $"Network error: {exception.HttpRequestError}."; }
+        catch (Exception) { error = "Delivery processing failed."; }
         await repository.FinalizeAsync(lease, startedAt, status, error, cancellationToken);
     }
 }
