@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../RelayForge.Domain/RelayForge.Domain.csproj" />
+  </ItemGroup>
+</Project>

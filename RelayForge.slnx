@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RelayForge.Api/RelayForge.Api.csproj" />
+    <Project Path="src/RelayForge.Domain/RelayForge.Domain.csproj" />
+    <Project Path="src/RelayForge.Infrastructure/RelayForge.Infrastructure.csproj" />
+    <Project Path="src/RelayForge.UnstableReceiver/RelayForge.UnstableReceiver.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RelayForge.Domain.Tests/RelayForge.Domain.Tests.csproj" />
+    <Project Path="tests/RelayForge.IntegrationTests/RelayForge.IntegrationTests.csproj" />
+  </Folder>
+</Solution>
