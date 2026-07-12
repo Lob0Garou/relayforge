@@ -8,6 +8,13 @@
         "slopwatch"
       ],
       "rollForward": false
+    },
+    "dotnet-ef": {
+      "version": "8.0.11",
+      "commands": [
+        "dotnet-ef"
+      ],
+      "rollForward": false
     }
   }
 }
