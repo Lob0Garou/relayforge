@@ -45,7 +45,7 @@ dotnet run --project src/RelayForge.Api
 ```
 
 The live health endpoint is available at `/health/live`.
-Database and validated startup readiness is available at `/health/ready`. The local MVP operations APIs intentionally have no authentication and must not be exposed to an untrusted network. Operational success/failure rates and latency use a documented rolling 24-hour attempt window.
+Database and validated startup readiness is available at `/health/ready`. The local MVP operations APIs intentionally have no authentication and must not be exposed to an untrusted network. Dead-letter replay is available at `POST /api/dead-letters/{deliveryId}/replay` in this local no-auth mode. Operational success/failure rates and latency use a documented rolling 24-hour attempt window.
 
 ### Data Protection outside Development
 
@@ -79,7 +79,7 @@ atomically clears the prior attempt counters. Status codes 400-599 are intention
 the simulator can model both terminal and transient failures. Send signed raw bodies to
 `POST /webhooks/relayforge`, and inspect attempts at `GET /operations/deliveries/{deliveryId}`.
 
-Delivery failures use five total attempts by default. Transient failures are scheduled by PostgreSQL with capped exponential backoff and jitter; permanent failures and exhausted transient failures are dead-lettered. Operators can list sanitized dead letters at `GET /api/dead-letters` (manual replay is intentionally not available yet).
+Delivery failures use five total attempts by default. Transient failures are scheduled by PostgreSQL with capped exponential backoff and jitter; permanent failures and exhausted transient failures are dead-lettered. Operators can list sanitized dead letters at `GET /api/dead-letters` and replay an eligible delivery with the local-only replay endpoint documented above.
 For any non-Development environment set `Receiver__SigningSecret` through configuration or the
 environment. The simulator's state is deliberately thread-safe but in-memory and process-local: it
 is a demo receiver, not a broker, durable queue, or delivery source of truth.

@@ -14,8 +14,8 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddProblemDetails();
 var exportTelemetry = !string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]);
 builder.Services.AddOpenTelemetry()
-    .WithTracing(tracing => { tracing.AddSource(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation().AddHttpClientInstrumentation(); if (exportTelemetry) tracing.AddOtlpExporter(); })
-    .WithMetrics(metrics => { metrics.AddMeter(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddRuntimeInstrumentation(); if (exportTelemetry) metrics.AddOtlpExporter(); });
+    .WithTracing(tracing => { tracing.AddSource(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation(); if (exportTelemetry) tracing.AddOtlpExporter(); })
+    .WithMetrics(metrics => { metrics.AddMeter(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation().AddRuntimeInstrumentation(); if (exportTelemetry) metrics.AddOtlpExporter(); });
 builder.Services.AddHealthChecks().AddDbContextCheck<RelayForgeDbContext>(tags: ["ready"]);
 builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 {

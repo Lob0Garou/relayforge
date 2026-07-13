@@ -35,7 +35,32 @@ public sealed class OperationsApiTests(PostgreSqlFixture fixture)
         Assert.DoesNotContain("never-expose-me", text);
         Assert.DoesNotContain("receiver.invalid", text);
         Assert.DoesNotContain("idempotency", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("safe snippet", text);
         Assert.Contains("\"pageSize\":100", await events.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Delivery_detail_bounds_history_and_never_returns_response_snippets()
+    {
+        var (_, incoming) = await SeedDeadLetterAsync(); var id = incoming.Delivery.Id.Value;
+        await using (var scope = fixture.Factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<RelayForgeDbContext>();
+            await db.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO delivery_attempts ("Id", "DeliveryId", "Number", "StartedAt", "CompletedAt", "DurationMilliseconds", "Outcome", "HttpStatusCode", "Error", response_snippet)
+                SELECT gen_random_uuid(), {id}, n, clock_timestamp(), clock_timestamp(), 0, 'Failed', 500, 'bounded_error', 'snippet-sentinel'
+                FROM generate_series(2, 106) n
+                """);
+            await db.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO delivery_replays ("Id", "DeliveryId", requested_at, starting_attempt_number, cycle_number)
+                SELECT gen_random_uuid(), {id}, clock_timestamp() + n * interval '1 second', n, n FROM generate_series(1, 55) n
+                """);
+        }
+        using var response = await fixture.Factory.CreateClient().GetAsync($"/api/deliveries/{id}");
+        var json = await response.Content.ReadAsStringAsync(); var document = JsonDocument.Parse(json); var root = document.RootElement;
+        Assert.Equal(100, root.GetProperty("attempts").GetArrayLength()); Assert.Equal(50, root.GetProperty("replays").GetArrayLength());
+        Assert.True(root.GetProperty("historyTruncated").GetBoolean()); Assert.DoesNotContain("snippet-sentinel", json); Assert.DoesNotContain("responseSnippet", json);
+        Assert.Equal(106, root.GetProperty("attempts")[0].GetProperty("number").GetInt32()); Assert.Equal(55, root.GetProperty("replays")[0].GetProperty("cycleNumber").GetInt32());
     }
 
     [Fact]

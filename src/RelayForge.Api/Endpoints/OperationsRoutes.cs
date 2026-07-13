@@ -46,9 +46,11 @@ public static class OperationsRoutes
         await using var db = await factory.CreateDbContextAsync(token); var key = new DeliveryId(id);
         var metadata = await (from d in db.Deliveries.AsNoTracking() join e in db.IncomingEvents.AsNoTracking() on d.EventId equals e.Id join w in db.WebhookEndpoints.AsNoTracking() on d.EndpointId equals w.Id where d.Id == key select new { deliveryId = d.Id.Value, status = d.Status.ToString(), attemptCount = d.AttemptCount, createdAt = d.CreatedAt, @event = new { id = e.Id.Value, type = e.EventType, receivedAt = e.CreatedAt }, endpoint = new { id = w.Id.Value, name = w.Name, active = w.IsActive } }).SingleOrDefaultAsync(token);
         if (metadata is null) return Results.NotFound();
-        var attempts = await db.DeliveryAttempts.AsNoTracking().Where(x => x.DeliveryId == key).OrderBy(x => x.Number).Select(x => new { id = x.Id, number = x.Number, startedAt = x.StartedAt, completedAt = x.CompletedAt, status = x.Outcome.ToString(), durationMilliseconds = x.DurationMilliseconds, httpStatus = x.HttpStatusCode, errorCode = x.Error, responseSnippet = x.ResponseSnippet }).ToListAsync(token);
-        var replays = await db.DeliveryReplays.AsNoTracking().Where(x => x.DeliveryId == key).OrderBy(x => x.CycleNumber).Select(x => new { replayId = x.Id.Value, cycleNumber = x.CycleNumber, startingAttemptNumber = x.StartingAttemptNumber, requestedAt = x.RequestedAt }).ToListAsync(token);
-        return Results.Ok(new { delivery = metadata, attempts, replays });
+        var attemptCount = await db.DeliveryAttempts.AsNoTracking().CountAsync(x => x.DeliveryId == key, token);
+        var replayCount = await db.DeliveryReplays.AsNoTracking().CountAsync(x => x.DeliveryId == key, token);
+        var attempts = await db.DeliveryAttempts.AsNoTracking().Where(x => x.DeliveryId == key).OrderByDescending(x => x.Number).ThenByDescending(x => x.Id).Take(100).Select(x => new { id = x.Id, number = x.Number, startedAt = x.StartedAt, completedAt = x.CompletedAt, status = x.Outcome.ToString(), durationMilliseconds = x.DurationMilliseconds, httpStatus = x.HttpStatusCode, errorCode = x.Error }).ToListAsync(token);
+        var replays = await db.DeliveryReplays.AsNoTracking().Where(x => x.DeliveryId == key).OrderByDescending(x => x.CycleNumber).ThenByDescending(x => x.RequestedAt).ThenByDescending(x => x.Id).Take(50).Select(x => new { replayId = x.Id.Value, cycleNumber = x.CycleNumber, startingAttemptNumber = x.StartingAttemptNumber, requestedAt = x.RequestedAt }).ToListAsync(token);
+        return Results.Ok(new { delivery = metadata, attemptHistoryCount = attemptCount, replayHistoryCount = replayCount, historyTruncated = attemptCount > 100 || replayCount > 50, attempts, replays });
     }
 
     private static async Task<IResult> ReplayAsync(Guid deliveryId, DeliveryReplayRepository repository, CancellationToken token)
