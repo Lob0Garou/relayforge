@@ -12,10 +12,23 @@ public static class OperationsRoutes
     public static IEndpointRouteBuilder MapOperationsRoutes(this IEndpointRouteBuilder routes)
     {
         routes.MapGet("/api/operations/overview", OverviewAsync);
+        routes.MapGet("/api/operations/endpoints", EndpointsAsync);
         routes.MapGet("/api/events", EventsAsync);
         routes.MapGet("/api/deliveries/{id:guid}", DetailAsync);
         routes.MapPost("/api/dead-letters/{deliveryId:guid}/replay", ReplayAsync);
         return routes;
+    }
+
+    private static async Task<IResult> EndpointsAsync(int? page, int? pageSize, IDbContextFactory<RelayForgeDbContext> factory, CancellationToken token)
+    {
+        var safePage = Math.Max(1, page ?? 1); var safeSize = Math.Clamp(pageSize ?? 20, 1, 100);
+        if (page is > 1000) return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Page must not exceed 1000."] });
+        await using var db = await factory.CreateDbContextAsync(token); var query = db.WebhookEndpoints.AsNoTracking();
+        var total = await query.CountAsync(token);
+        var rows = await query.OrderBy(x => x.CreatedAt).ThenBy(x => x.Id).Skip((safePage - 1) * safeSize).Take(safeSize)
+            .Select(x => new { x.Id, x.Name, x.IsActive, x.Timeout, x.CreatedAt }).ToListAsync(token);
+        var items = rows.Select(x => new { id = x.Id.Value, name = x.Name, isActive = x.IsActive, timeoutSeconds = (int)x.Timeout.TotalSeconds, createdAt = x.CreatedAt });
+        return Results.Ok(new { page = safePage, pageSize = safeSize, total, items });
     }
 
     private static async Task<IResult> OverviewAsync(IDbContextFactory<RelayForgeDbContext> factory, CancellationToken token)

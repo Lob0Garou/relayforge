@@ -48,6 +48,26 @@ public sealed class OperationsApiTests(PostgreSqlFixture fixture)
     }
 
     [Fact]
+    public async Task Operations_endpoints_contract_is_bounded_and_omits_destination_and_secrets()
+    {
+        var (endpoint, _) = await SeedEventAsync(deadLetter: false);
+        using var response = await fixture.Factory.CreateClient().GetAsync("/api/operations/endpoints?page=1&pageSize=9999");
+        response.EnsureSuccessStatusCode();
+        var json = await response.Content.ReadAsStringAsync();
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(100, root.GetProperty("pageSize").GetInt32());
+        var item = Assert.Single(root.GetProperty("items").EnumerateArray());
+        Assert.Equal(endpoint.Id.Value, item.GetProperty("id").GetGuid());
+        Assert.Equal("Receiver", item.GetProperty("name").GetString());
+        Assert.Equal(30, item.GetProperty("timeoutSeconds").GetInt32());
+        Assert.DoesNotContain("receiver.invalid", json);
+        Assert.DoesNotContain("never-expose-me", json);
+        Assert.DoesNotContain("url", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", json, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Delivery_detail_bounds_history_and_never_returns_response_snippets()
     {
         var (_, incoming) = await SeedDeadLetterAsync(); var id = incoming.Delivery.Id.Value;

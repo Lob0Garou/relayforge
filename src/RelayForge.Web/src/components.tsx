@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-const labels:Record<string,string>={DeadLettered:'Dead letter',RetryScheduled:'Retrying',Replayed:'Replayed',Delivered:'Delivered',Pending:'Pending',Failed:'Failed'};
+const labels:Record<string,string>={DeadLettered:'Dead letter',RetryScheduled:'Retrying',Replayed:'Replayed',Delivered:'Delivered',Pending:'Pending',Failed:'Failed',Active:'Active',Inactive:'Inactive'};
 export function StatusBadge({status}:{status:string}){return <span className={`status status-${status.toLowerCase()}`}><span aria-hidden="true">●</span> {labels[status]??status}</span>}
 export function Panel({title,actions,children,className=''}:{title:string;actions?:ReactNode;children:ReactNode;className?:string}){return <section className={`panel ${className}`}><header className="panel-head"><h2>{title}</h2>{actions}</header>{children}</section>}
 export function State({kind='loading',message,retry}:{kind?:'loading'|'empty'|'error';message:string;retry?:()=>void}){return <div className={`state ${kind}`} role={kind==='error'?'alert':'status'}><strong>{kind==='loading'?'Loading':kind==='empty'?'No records':'Unable to load'}</strong><span>{message}</span>{retry&&<button onClick={retry}>Retry</button>}</div>}
