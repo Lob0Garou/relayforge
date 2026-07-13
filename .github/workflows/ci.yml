@@ -1,0 +1,46 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.301
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/RelayForge.Web/package-lock.json
+      - run: dotnet tool restore
+      - run: dotnet slopwatch --no-baseline --fail-on warning
+      - run: dotnet restore RelayForge.slnx --locked-mode
+      - run: dotnet build RelayForge.slnx -c Release --no-restore
+      - run: dotnet test RelayForge.slnx -c Release --no-build
+      - working-directory: src/RelayForge.Web
+        run: npm ci
+      - working-directory: src/RelayForge.Web
+        run: npm audit --audit-level=high
+      - working-directory: src/RelayForge.Web
+        run: npm run lint && npm run typecheck && npm test && npm run build
+      - working-directory: src/RelayForge.Web
+        run: npx playwright install --with-deps chromium
+      - working-directory: src/RelayForge.Web
+        run: npm run test:e2e
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose up -d --wait
+      - shell: pwsh
+        run: ./scripts/demo.ps1
+      - if: always()
+        run: docker compose down -v

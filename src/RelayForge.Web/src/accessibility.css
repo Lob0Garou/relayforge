@@ -1,0 +1,4 @@
+.status-active{color:var(--lime)}
+.status-inactive{color:#c0c7c3}
+.row-link{color:#dfe5e1;text-decoration:none}
+.row-link:hover{text-decoration:underline;text-decoration-color:var(--lime)}
