@@ -17,6 +17,8 @@ entire DNS answer set when any address is private or otherwise non-public, and c
 the selected validated IP while retaining the original hostname for the HTTP Host header and TLS SNI.
 Redirects and proxy/environment-proxy use are disabled. Connections are pooled for a bounded lifetime;
 each new pooled connection repeats this single-resolution validation, while reuse avoids DNS churn.
+The pool lifetime is a deliberate upper bound, not DNS-TTL-aware: an existing connection may remain
+in use until that bound expires, and every replacement connection performs a fresh policy-gated resolution.
 
 Development may explicitly allow exact private hostnames such as `unstable-receiver` or `localhost`
 through `OutboundDelivery:AllowedPrivateHosts`. Wildcards and IP literals are not accepted, and any

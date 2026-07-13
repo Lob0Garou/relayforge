@@ -17,9 +17,9 @@ public sealed class OutboundSecurityTests
     public static TheoryData<string> ForbiddenAddresses => new()
     {
         "0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "192.168.1.1",
-        "192.0.2.1", "198.18.0.1", "198.51.100.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+        "192.0.2.1", "192.31.196.1", "192.52.193.1", "192.88.99.2", "192.175.48.1", "198.18.0.1", "198.51.100.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
         "::", "::1", "fe80::1", "fec0::1", "fc00::1", "ff02::1", "2001:db8::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1"
-        , "100::1", "2001:2::1", "3ffe::1", "2001::1", "2002::1"
+        , "64:ff9b::1", "64:ff9b:1::1", "100::1", "2001:2::1", "2001:20::1", "2001:30::1", "3ffe::1", "2001::1", "2002::1"
     };
 
     [Theory]
@@ -57,6 +57,28 @@ public sealed class OutboundSecurityTests
     [InlineData("http://example.com:0/hook")]
     public void Destination_policy_rejects_unsupported_or_literal_private_destinations(string value) =>
         Assert.False(new DestinationPolicy(["localhost"]).Evaluate(new Uri(value)).Allowed);
+
+    [Fact]
+    public void Destination_policy_rejects_userinfo_scoped_ipv6_and_invalid_allowlists()
+    {
+        Assert.False(new DestinationPolicy([]).Evaluate(new Uri("https://user:pass@example.com/hook")).Allowed);
+        var scoped = IPAddress.Parse("2606:4700::1111%1");
+        Assert.False(DestinationPolicy.IsPublicAddress(scoped));
+        Assert.ThrowsAny<Exception>(() => new DestinationPolicy(null!));
+        Assert.ThrowsAny<Exception>(() => new DestinationPolicy(["bad host"]));
+    }
+
+    [Theory]
+    [InlineData("192.88.98.255", true)]
+    [InlineData("192.88.99.0", false)]
+    [InlineData("192.88.99.255", false)]
+    [InlineData("192.88.100.0", true)]
+    [InlineData("198.17.255.255", true)]
+    [InlineData("198.18.0.0", false)]
+    [InlineData("198.19.255.255", false)]
+    [InlineData("198.20.0.0", true)]
+    public void Cidr_boundaries_are_matched_exactly(string address, bool expected) =>
+        Assert.Equal(expected, DestinationPolicy.IsPublicAddress(IPAddress.Parse(address)));
 
     [Fact]
     public async Task Mixed_dns_answers_fail_closed_and_rebinding_resolver_is_called_once()
@@ -155,6 +177,50 @@ public sealed class OutboundSecurityTests
         var content = new StringContent(extra ? "123456789" : "12345678");
         var snippet = await BoundedResponseReader.ReadAsync(content, limit, default);
         Assert.Equal(expected, snippet);
+    }
+
+    [Theory]
+    [InlineData("é", 1)]
+    [InlineData("€", 1)]
+    [InlineData("€", 2)]
+    [InlineData("😀", 1)]
+    [InlineData("😀", 2)]
+    [InlineData("😀", 3)]
+    public async Task Response_reader_never_emits_replacement_character_for_partial_utf8_runes(string rune, int bytes)
+    {
+        using var content = new StringContent("A" + rune + "Z", Encoding.UTF8);
+        var snippet = await BoundedResponseReader.ReadAsync(content, 1 + bytes, default);
+        Assert.DoesNotContain('\uFFFD', snippet!);
+        Assert.Equal("A[truncated]", snippet);
+    }
+
+    [Theory]
+    [InlineData("é", 2)]
+    [InlineData("€", 3)]
+    [InlineData("😀", 4)]
+    public async Task Response_reader_preserves_complete_multibyte_runes_at_exact_and_plus_one_byte_limits(string rune, int runeBytes)
+    {
+        using var exactContent = new StringContent(rune + "X", Encoding.UTF8);
+        Assert.Equal(rune + "[truncated]", await BoundedResponseReader.ReadAsync(exactContent, runeBytes, default));
+        using var plusOneContent = new StringContent(rune + "XY", Encoding.UTF8);
+        Assert.Equal(rune + "X[truncated]", await BoundedResponseReader.ReadAsync(plusOneContent, runeBytes + 1, default));
+    }
+
+    [Fact]
+    public async Task Response_reader_redacts_overlapping_sensitive_values_at_multibyte_cut()
+    {
+        const string longer = "segredo-😀-final";
+        using var content = new StringContent("prefix:" + longer, Encoding.UTF8);
+        var snippet = await BoundedResponseReader.ReadAsync(content, 17, ["segredo-😀", longer], default);
+        Assert.Equal("prefix:[redacted][truncated]", snippet);
+        Assert.DoesNotContain('\uFFFD', snippet!);
+    }
+
+    [Fact]
+    public async Task Response_reader_redacts_longest_overlapping_sensitive_value_first()
+    {
+        using var content = new StringContent("abcdef");
+        Assert.Equal("[redacted]", await BoundedResponseReader.ReadAsync(content, 32, ["abc", "abcdef"], default));
     }
 
     [Fact]

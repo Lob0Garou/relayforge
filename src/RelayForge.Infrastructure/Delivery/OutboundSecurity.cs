@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Collections.Immutable;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -29,10 +30,21 @@ public readonly record struct DestinationDecision(bool Allowed, string Host, boo
 
 public sealed class DestinationPolicy
 {
+    // IANA Special-Purpose Address Registry snapshot 2026-07. Whole listed blocks are denied fail-closed,
+    // including blocks that may contain narrowly defined globally reachable exceptions.
+    private static readonly ImmutableArray<CidrBlock> ForbiddenIpv4 = CreateCidrs(
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+        "192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
+        "192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4");
+    private static readonly ImmutableArray<CidrBlock> ForbiddenIpv6 = CreateCidrs(
+        "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23",
+        "2001:db8::/32", "2002::/16", "3ffe::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8");
+    private static readonly CidrBlock GlobalIpv6Unicast = CidrBlock.Parse("2000::/3");
     private readonly HashSet<string> _allowedPrivateHosts;
 
     public DestinationPolicy(IEnumerable<string> allowedPrivateHosts)
     {
+        ArgumentNullException.ThrowIfNull(allowedPrivateHosts);
         _allowedPrivateHosts = new(allowedPrivateHosts.Select(CanonicalizeHost), StringComparer.Ordinal);
         if (_allowedPrivateHosts.Any(string.IsNullOrEmpty)) throw new InvalidOperationException("Private host allowlist entries must be exact hostnames.");
         if (_allowedPrivateHosts.Any(host => host.Contains('*', StringComparison.Ordinal))) throw new InvalidOperationException("Private host allowlist entries cannot contain wildcards.");
@@ -41,7 +53,7 @@ public sealed class DestinationPolicy
 
     public DestinationDecision Evaluate(Uri destination)
     {
-        if (!destination.IsAbsoluteUri || destination.Scheme is not ("http" or "https") || destination.Port is < 1 or > 65_535)
+        if (!destination.IsAbsoluteUri || destination.Scheme is not ("http" or "https") || destination.Port is < 1 or > 65_535 || destination.UserInfo.Length != 0)
             return new(false, string.Empty, false);
         var host = CanonicalizeHost(destination.IdnHost);
         if (IPAddress.TryParse(host, out var literal)) return new(IsPublicAddress(literal), host, false);
@@ -52,7 +64,10 @@ public sealed class DestinationPolicy
     {
         var trimmed = host.Trim().TrimEnd('.');
         if (trimmed.Length == 0) return string.Empty;
-        return new IdnMapping().GetAscii(trimmed).ToLowerInvariant();
+        var canonical = new IdnMapping().GetAscii(trimmed).ToLowerInvariant();
+        if (canonical.Any(char.IsWhiteSpace) || Uri.CheckHostName(canonical) == UriHostNameType.Unknown)
+            throw new InvalidOperationException("Private host allowlist entries must be valid exact hostnames.");
+        return canonical;
     }
 
     public static bool IsPublicAddress(IPAddress address)
@@ -60,37 +75,32 @@ public sealed class DestinationPolicy
         if (address.IsIPv4MappedToIPv6) return false;
         if (address.AddressFamily == AddressFamily.InterNetworkV6)
         {
-            var bytes = address.GetAddressBytes();
-            return MatchesPrefix(bytes, [0x20], 3) &&
-                   !MatchesPrefix(bytes, [0x20, 0x01, 0x00], 23) &&
-                   !MatchesPrefix(bytes, [0x20, 0x01, 0x0d, 0xb8], 32) &&
-                   !MatchesPrefix(bytes, [0x20, 0x02], 16) &&
-                   !MatchesPrefix(bytes, [0x3f, 0xfe], 16);
+            return address.ScopeId == 0 && GlobalIpv6Unicast.Contains(address) && !ForbiddenIpv6.Any(block => block.Contains(address));
         }
         if (address.AddressFamily != AddressFamily.InterNetwork) return false;
-        var b = address.GetAddressBytes();
-        return b switch
-        {
-            [0, ..] or [10, ..] or [127, ..] or [255, 255, 255, 255] => false,
-            [100, >= 64 and <= 127, ..] => false,
-            [169, 254, ..] => false,
-            [172, >= 16 and <= 31, ..] => false,
-            [192, 0, 0, ..] or [192, 0, 2, ..] or [192, 168, ..] => false,
-            [198, 18 or 19, ..] or [198, 51, 100, ..] => false,
-            [203, 0, 113, ..] => false,
-            [>= 224, ..] => false,
-            _ => true
-        };
+        return !ForbiddenIpv4.Any(block => block.Contains(address));
     }
 
-    private static bool MatchesPrefix(ReadOnlySpan<byte> address, ReadOnlySpan<byte> prefix, int prefixLength)
+    private static ImmutableArray<CidrBlock> CreateCidrs(params string[] values) => values.Select(CidrBlock.Parse).ToImmutableArray();
+
+    private readonly record struct CidrBlock(IPAddress Network, int PrefixLength)
     {
-        var wholeBytes = prefixLength / 8;
-        if (!address[..wholeBytes].SequenceEqual(prefix[..wholeBytes])) return false;
-        var remainingBits = prefixLength % 8;
-        if (remainingBits == 0) return true;
-        var mask = (byte)(0xff << (8 - remainingBits));
-        return (address[wholeBytes] & mask) == (prefix[wholeBytes] & mask);
+        public static CidrBlock Parse(string value)
+        {
+            var parts = value.Split('/');
+            return new(IPAddress.Parse(parts[0]), int.Parse(parts[1], CultureInfo.InvariantCulture));
+        }
+
+        public bool Contains(IPAddress address)
+        {
+            if (address.AddressFamily != Network.AddressFamily) return false;
+            var candidate = address.GetAddressBytes(); var network = Network.GetAddressBytes(); var wholeBytes = PrefixLength / 8;
+            if (!candidate.AsSpan(0, wholeBytes).SequenceEqual(network.AsSpan(0, wholeBytes))) return false;
+            var remainingBits = PrefixLength % 8;
+            if (remainingBits == 0) return true;
+            var mask = (byte)(0xff << (8 - remainingBits));
+            return (candidate[wholeBytes] & mask) == (network[wholeBytes] & mask);
+        }
     }
 }
 
@@ -189,18 +199,40 @@ public static class BoundedResponseReader
                 remaining -= read;
             }
             var truncated = output.Length == byteLimit && remaining == 0;
-            var text = Encoding.UTF8.GetString(output.GetBuffer(), 0, (int)output.Length);
+            var text = DecodeValidUtf8Prefix(output.GetBuffer(), (int)output.Length);
             var normalized = new string(text.Where(c => !char.IsControl(c)).ToArray());
             var redacted = SensitiveHeaderLikeContent.Replace(normalized, "[redacted]");
-            foreach (var sensitiveValue in sensitiveValues)
+            var normalizedSensitiveValues = sensitiveValues
+                .Select(value => new string(value.Where(c => !char.IsControl(c)).ToArray()))
+                .Where(value => value.Length != 0)
+                .Distinct(StringComparer.Ordinal)
+                .OrderByDescending(value => value.Length);
+            foreach (var normalizedSensitiveValue in normalizedSensitiveValues)
             {
-                var normalizedSensitiveValue = new string(sensitiveValue.Where(c => !char.IsControl(c)).ToArray());
-                if (normalizedSensitiveValue.Length != 0) redacted = RedactKnownValue(redacted, normalizedSensitiveValue);
+                redacted = RedactKnownValue(redacted, normalizedSensitiveValue);
             }
             var sanitized = new string(redacted.Where(c => !char.IsControl(c) || c is '\t').ToArray());
             return sanitized.Length == 0 && !truncated ? null : sanitized + (truncated ? TruncatedMarker : string.Empty);
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }
+    }
+
+    private static string DecodeValidUtf8Prefix(byte[] buffer, int length)
+    {
+        var bytes = buffer.AsSpan(0, length);
+        return Encoding.UTF8.GetString(bytes[..ValidUtf8PrefixLength(bytes)]);
+    }
+
+    private static int ValidUtf8PrefixLength(ReadOnlySpan<byte> bytes)
+    {
+        var consumedTotal = 0;
+        while (consumedTotal < bytes.Length)
+        {
+            var status = Rune.DecodeFromUtf8(bytes[consumedTotal..], out _, out var consumed);
+            if (status != OperationStatus.Done) break;
+            consumedTotal += consumed;
+        }
+        return consumedTotal;
     }
 
     private static string RedactKnownValue(string text, string sensitiveValue)
