@@ -1,0 +1,8 @@
+import type { ReactNode } from 'react';
+const labels:Record<string,string>={DeadLettered:'Dead letter',RetryScheduled:'Retrying',Replayed:'Replayed',Delivered:'Delivered',Pending:'Pending',Failed:'Failed'};
+export function StatusBadge({status}:{status:string}){return <span className={`status status-${status.toLowerCase()}`}><span aria-hidden="true">●</span> {labels[status]??status}</span>}
+export function Panel({title,actions,children,className=''}:{title:string;actions?:ReactNode;children:ReactNode;className?:string}){return <section className={`panel ${className}`}><header className="panel-head"><h2>{title}</h2>{actions}</header>{children}</section>}
+export function State({kind='loading',message,retry}:{kind?:'loading'|'empty'|'error';message:string;retry?:()=>void}){return <div className={`state ${kind}`} role={kind==='error'?'alert':'status'}><strong>{kind==='loading'?'Loading':kind==='empty'?'No records':'Unable to load'}</strong><span>{message}</span>{retry&&<button onClick={retry}>Retry</button>}</div>}
+export function Pager({page,total,pageSize=20,onChange}:{page:number;total:number;pageSize?:number;onChange:(p:number)=>void}){return <nav className="pager" aria-label="Pagination"><span>{total.toLocaleString()} records</span><button disabled={page<=1} onClick={()=>onChange(page-1)}>Previous</button><span>Page {page}</span><button disabled={page*pageSize>=total} onClick={()=>onChange(page+1)}>Next</button></nav>}
+export const ShortId=({value}:{value:string})=><code title={value}>{value.slice(0,8)}…{value.slice(-4)}</code>;
+export const Time=({value}:{value:string})=><time dateTime={value}>{new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'medium'}).format(new Date(value))}</time>;

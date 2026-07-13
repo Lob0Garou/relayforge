@@ -47,6 +47,18 @@ dotnet run --project src/RelayForge.Api
 The live health endpoint is available at `/health/live`.
 Database and validated startup readiness is available at `/health/ready`. The local MVP operations APIs intentionally have no authentication and must not be exposed to an untrusted network. Dead-letter replay is available at `POST /api/dead-letters/{deliveryId}/replay` in this local no-auth mode. Operational success/failure rates and latency use a documented rolling 24-hour attempt window.
 
+### Operations dashboard
+
+Run the API, then start the Vite operator console in a second PowerShell window:
+
+```powershell
+Set-Location src/RelayForge.Web
+npm.cmd ci
+npm.cmd run dev
+```
+
+The development server proxies `/api` and `/health` to `http://localhost:5000`. Override that target with `VITE_API_PROXY_TARGET` when the API listens elsewhere. Production deployments can set `VITE_API_BASE_URL` or serve both applications under the same origin. The dashboard uses only the sanitized operations APIs; do not expose the unauthenticated MVP operations surface to an untrusted network.
+
 ### Data Protection outside Development
 
 Production-like environments must mount a persistent keyring shared by all application instances and an X509 certificate/private key pair in PEM format. Configure these values through environment variables; never commit the certificate or private key:
