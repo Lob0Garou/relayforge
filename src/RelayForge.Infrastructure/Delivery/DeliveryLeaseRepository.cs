@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using RelayForge.Domain.Events;
 using RelayForge.Infrastructure.Persistence;
 using RelayForge.Domain.Retry;
+using RelayForge.Infrastructure;
 
 namespace RelayForge.Infrastructure.Delivery;
 
@@ -12,6 +13,8 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
 {
     public async Task<IReadOnlyList<DeliveryLease>> ClaimAsync(int batchSize, TimeSpan leaseDuration, CancellationToken cancellationToken, int maxAttempts = RetryPolicyOptions.DefaultMaxAttempts)
     {
+        using var activity = RelayForgeTelemetry.ActivitySource.StartActivity("delivery.claim_batch");
+        activity?.SetTag("batch.size", batchSize);
         _ = processClock; // Accepted for DI/test skew; lease authority remains PostgreSQL.
         var leaseId = Guid.NewGuid();
         await using var db = await factory.CreateDbContextAsync(cancellationToken);

@@ -9,6 +9,7 @@ namespace RelayForge.Domain.Events;
 
 public readonly record struct IncomingEventId(Guid Value) { public static IncomingEventId New() => new(Guid.NewGuid()); }
 public readonly record struct DeliveryId(Guid Value) { public static DeliveryId New() => new(Guid.NewGuid()); }
+public readonly record struct DeliveryReplayId(Guid Value) { public static DeliveryReplayId New() => new(Guid.NewGuid()); }
 public enum EventStatus { Pending }
 public enum DeliveryStatus { Pending, Processing, Delivered, RetryScheduled, DeadLettered, Replayed }
 public enum DeliveryAttemptOutcome { Delivered, Failed }
@@ -117,6 +118,20 @@ public sealed class DeliveryAttempt
     public string? ResponseSnippet { get; private set; }
     public static DeliveryAttempt Create(DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error, string? responseSnippet = null) => new(Guid.NewGuid(), deliveryId, number, startedAt, completedAt, outcome, statusCode, error, responseSnippet);
     private static string? Sanitize(string? value, int limit = 1000) => string.IsNullOrWhiteSpace(value) ? null : new string(value.Where(c => !char.IsControl(c)).Take(limit).ToArray());
+}
+
+public sealed class DeliveryReplay
+{
+    private DeliveryReplay() { }
+    private DeliveryReplay(DeliveryReplayId id, DeliveryId deliveryId, DateTimeOffset requestedAt, int startingAttemptNumber, int cycleNumber)
+    { Id = id; DeliveryId = deliveryId; RequestedAt = requestedAt; StartingAttemptNumber = startingAttemptNumber; CycleNumber = cycleNumber; }
+    public DeliveryReplayId Id { get; private set; }
+    public DeliveryId DeliveryId { get; private set; }
+    public DateTimeOffset RequestedAt { get; private set; }
+    public int StartingAttemptNumber { get; private set; }
+    public int CycleNumber { get; private set; }
+    public static DeliveryReplay Create(DeliveryReplayId id, DeliveryId deliveryId, DateTimeOffset requestedAt, int startingAttemptNumber, int cycleNumber) =>
+        new(id, deliveryId, requestedAt, startingAttemptNumber, cycleNumber);
 }
 
 public static class EventFingerprint

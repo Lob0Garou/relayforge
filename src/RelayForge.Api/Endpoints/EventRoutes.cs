@@ -7,6 +7,7 @@ using Npgsql;
 using RelayForge.Domain.Endpoints;
 using RelayForge.Domain.Events;
 using RelayForge.Infrastructure.Persistence;
+using RelayForge.Infrastructure;
 
 namespace RelayForge.Api.Endpoints;
 
@@ -18,6 +19,7 @@ public static class EventRoutes
 
     private static async Task<IResult> IngestAsync(HttpRequest request, RelayForgeDbContext db, IServiceScopeFactory scopeFactory, CancellationToken cancellationToken)
     {
+        using var activity = RelayForgeTelemetry.ActivitySource.StartActivity("event.ingest");
         var bodySizeFeature = request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodySizeFeature is { IsReadOnly: false }) bodySizeFeature.MaxRequestBodySize = MaxBodyBytes;
         var key = request.Headers["Idempotency-Key"].ToString();
@@ -75,8 +77,8 @@ public static class EventRoutes
         }
     }
     private static bool HasDuplicates(JsonElement element) { if (element.ValueKind == JsonValueKind.Object) { var names = new HashSet<string>(StringComparer.Ordinal); foreach (var p in element.EnumerateObject()) { if (!names.Add(p.Name) || HasDuplicates(p.Value)) return true; } } else if (element.ValueKind == JsonValueKind.Array) foreach (var item in element.EnumerateArray()) if (HasDuplicates(item)) return true; return false; }
-    private static IResult Existing(IncomingEvent value, string fingerprint) => value.Fingerprint == fingerprint ? Accepted(value) : TypedResults.Problem(statusCode: 409, title: "Idempotency conflict", detail: "The global idempotency key was already used with different content.");
-    private static IResult Accepted(IncomingEvent value) => TypedResults.Accepted($"/api/events/{value.Id.Value}", new EventResponse(value.Id.Value, value.Delivery.Id.Value, "Pending"));
+    private static IResult Existing(IncomingEvent value, string fingerprint) { var same = value.Fingerprint == fingerprint; RelayForgeTelemetry.Events.Add(1, new KeyValuePair<string, object?>("outcome", same ? "deduplicated" : "conflict")); return same ? Accepted(value, false) : TypedResults.Problem(statusCode: 409, title: "Idempotency conflict", detail: "The global idempotency key was already used with different content."); }
+    private static IResult Accepted(IncomingEvent value, bool record = true) { if (record) RelayForgeTelemetry.Events.Add(1, new KeyValuePair<string, object?>("outcome", "accepted")); return TypedResults.Accepted($"/api/events/{value.Id.Value}", new EventResponse(value.Id.Value, value.Delivery.Id.Value, "Pending")); }
     private static IResult Validation(string key, string message) => TypedResults.ValidationProblem(new Dictionary<string, string[]> { [key] = [message] });
     private sealed record EventRequest(Guid EndpointId, string EventType, string Payload);
     private sealed record EventResponse(Guid EventId, Guid DeliveryId, string State);

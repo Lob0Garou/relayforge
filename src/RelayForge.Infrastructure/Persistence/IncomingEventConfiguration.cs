@@ -59,3 +59,18 @@ public sealed class DeliveryAttemptConfiguration : IEntityTypeConfiguration<Deli
         builder.HasIndex(x => new { x.DeliveryId, x.Number }).IsUnique();
     }
 }
+
+public sealed class DeliveryReplayConfiguration : IEntityTypeConfiguration<DeliveryReplay>
+{
+    public void Configure(EntityTypeBuilder<DeliveryReplay> builder)
+    {
+        builder.ToTable("delivery_replays"); builder.HasKey(x => x.Id);
+        builder.Property(x => x.Id).HasConversion(x => x.Value, x => new(x)).ValueGeneratedNever();
+        builder.Property(x => x.DeliveryId).HasConversion(x => x.Value, x => new(x));
+        builder.Property(x => x.RequestedAt).HasColumnName("requested_at");
+        builder.Property(x => x.StartingAttemptNumber).HasColumnName("starting_attempt_number");
+        builder.Property(x => x.CycleNumber).HasColumnName("cycle_number");
+        builder.HasIndex(x => new { x.DeliveryId, x.CycleNumber }).IsUnique();
+        builder.HasOne<RelayForge.Domain.Events.Delivery>().WithMany().HasForeignKey(x => x.DeliveryId).OnDelete(DeleteBehavior.Cascade);
+    }
+}

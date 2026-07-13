@@ -45,6 +45,7 @@ dotnet run --project src/RelayForge.Api
 ```
 
 The live health endpoint is available at `/health/live`.
+Database and validated startup readiness is available at `/health/ready`. The local MVP operations APIs intentionally have no authentication and must not be exposed to an untrusted network. Operational success/failure rates and latency use a documented rolling 24-hour attempt window.
 
 ### Data Protection outside Development
 

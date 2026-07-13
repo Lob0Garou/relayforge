@@ -5,11 +5,18 @@ using RelayForge.Api.Endpoints;
 using RelayForge.Infrastructure.Persistence;
 using RelayForge.Infrastructure.Delivery;
 using RelayForge.Domain.Retry;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
+using RelayForge.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddProblemDetails();
-builder.Services.AddHealthChecks();
+var exportTelemetry = !string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => { tracing.AddSource(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation().AddHttpClientInstrumentation(); if (exportTelemetry) tracing.AddOtlpExporter(); })
+    .WithMetrics(metrics => { metrics.AddMeter(RelayForgeTelemetry.Name).AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddRuntimeInstrumentation(); if (exportTelemetry) metrics.AddOtlpExporter(); });
+builder.Services.AddHealthChecks().AddDbContextCheck<RelayForgeDbContext>(tags: ["ready"]);
 builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 {
     options.UseNpgsql(builder.Configuration.GetConnectionString("RelayForge") ??
@@ -21,6 +28,7 @@ builder.Services.AddSingleton<IDestinationResolver, SystemDestinationResolver>()
 builder.Services.AddSingleton<IAddressConnector, SocketAddressConnector>();
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
+builder.Services.AddScoped<DeliveryReplayRepository>();
 builder.Services.AddSingleton<IJitterSource, SystemJitterSource>();
 builder.Services.AddSingleton(sp => new RetryPolicy(new RetryPolicyOptions(sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<DeliveryWorkerOptions>>().Value.MaxAttempts), sp.GetRequiredService<IJitterSource>()));
 builder.Services.AddOptions<DeliveryWorkerOptions>().Bind(builder.Configuration.GetSection("DeliveryWorker"))
@@ -90,10 +98,12 @@ if (!builder.Environment.IsDevelopment())
 var app = builder.Build();
 
 app.UseExceptionHandler();
-app.MapHealthChecks("/health/live");
+app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
 app.MapWebhookEndpoints();
 app.MapEventRoutes();
 app.MapDeadLetterRoutes();
+app.MapOperationsRoutes();
 
 app.Run();
 
