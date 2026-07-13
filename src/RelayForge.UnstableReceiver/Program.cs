@@ -24,6 +24,24 @@ builder.Services.AddSingleton(serviceProvider =>
 
 var app = builder.Build();
 
+app.MapGet("/health/live", () => Results.Ok(new { status = "healthy" }));
+if (app.Environment.IsDevelopment())
+{
+    app.MapPut("/control/secret", (RotateSecretRequest request, ReceiverSigningConfiguration signing) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Secret) || request.Secret.Length is < 16 or > 256)
+        {
+            return Results.ValidationProblem(new Dictionary<string, string[]>
+            {
+                ["secret"] = ["Secret must contain from 16 to 256 characters."]
+            });
+        }
+
+        signing.Rotate(Encoding.UTF8.GetBytes(request.Secret));
+        return Results.NoContent();
+    });
+}
+
 app.MapPut("/operations/scenario", (ReceiverScenario scenario, ReceiverSimulator simulator) =>
 {
     // Any 4xx or 5xx is intentional: demos may model terminal or transient receiver failures.

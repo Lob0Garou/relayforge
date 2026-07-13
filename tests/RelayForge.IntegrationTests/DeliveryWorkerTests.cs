@@ -131,9 +131,9 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
         await dispatcher.DispatchAsync(lease, default);
 
         Assert.Equal(lease.Payload, handler.Body);
-        var timestamp = long.Parse(handler.Headers["X-RelayForge-Timestamp"]);
-        Assert.Equal(lease.DeliveryId.ToString("D"), handler.Headers["X-RelayForge-Delivery"]);
-        Assert.True(WebhookSigner.Verify(Encoding.UTF8.GetBytes(secret), timestamp, lease.DeliveryId, Encoding.UTF8.GetBytes(handler.Body), handler.Headers["X-RelayForge-Signature"], TimeSpan.FromMinutes(1), TimeProvider.System));
+        var timestamp = long.Parse(handler.Headers["RelayForge-Timestamp"]);
+        Assert.Equal(lease.DeliveryId.ToString("D"), handler.Headers["RelayForge-Delivery-Id"]);
+        Assert.True(WebhookSigner.Verify(Encoding.UTF8.GetBytes(secret), timestamp, lease.DeliveryId, Encoding.UTF8.GetBytes(handler.Body), handler.Headers["RelayForge-Signature"], TimeSpan.FromMinutes(1), TimeProvider.System));
         await using var db = await Factory().CreateDbContextAsync();
         Assert.Equal(DeliveryStatus.Delivered, (await db.Deliveries.SingleAsync()).Status);
         Assert.Single(await db.DeliveryAttempts.ToListAsync());
@@ -479,7 +479,7 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
     private sealed class RetryAfterHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests); response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(120)); return Task.FromResult(response); } }
     private sealed class BodyHandler(string body, string cookie) : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent(body) }; response.Headers.Add("Set-Cookie", cookie); return Task.FromResult(response); } }
-    private sealed class EchoSensitiveHandler(string secret) : HttpMessageHandler { protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var payload = await request.Content!.ReadAsStringAsync(cancellationToken); var signature = Assert.Single(request.Headers.GetValues("X-RelayForge-Signature")); return new(HttpStatusCode.BadRequest) { Content = new StringContent($"{payload}|{signature}|{secret}") }; } }
+    private sealed class EchoSensitiveHandler(string secret) : HttpMessageHandler { protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var payload = await request.Content!.ReadAsStringAsync(cancellationToken); var signature = Assert.Single(request.Headers.GetValues("RelayForge-Signature")); return new(HttpStatusCode.BadRequest) { Content = new StringContent($"{payload}|{signature}|{secret}") }; } }
     private sealed class ThrowingJitter : RelayForge.Domain.Retry.IJitterSource { public double NextUnit() => throw new InvalidOperationException("policy defect details"); }
     private sealed class FirstThrowJitter : RelayForge.Domain.Retry.IJitterSource { private int _calls; public double NextUnit() => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("sensitive policy details") : .5; }
     private sealed class SequencedResponseHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }

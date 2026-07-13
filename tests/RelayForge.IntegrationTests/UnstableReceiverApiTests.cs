@@ -219,6 +219,58 @@ public sealed class UnstableReceiverApiTests : IClassFixture<UnstableReceiverFac
     }
 }
 
+public sealed class UnstableReceiverSecretControlTests : IClassFixture<UnstableReceiverFactory>
+{
+    private readonly UnstableReceiverFactory _factory;
+    public UnstableReceiverSecretControlTests(UnstableReceiverFactory factory) => _factory = factory;
+
+    [Fact]
+    public async Task Secret_control_is_absent_outside_development()
+    {
+        var response = await _factory.CreateClient().PutAsJsonAsync("/control/secret", new { secret = "replacement-secret-123" });
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("short")]
+    public async Task Secret_control_rejects_out_of_bounds_values(string secret)
+    {
+        using var client = DevelopmentClient();
+        var response = await client.PutAsJsonAsync("/control/secret", new { secret });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rotating_secret_accepts_new_signature_and_rejects_old_signature()
+    {
+        const string replacement = "replacement-secret-123";
+        using var client = DevelopmentClient();
+        var rotated = await client.PutAsJsonAsync("/control/secret", new { secret = replacement });
+        var deliveryId = Guid.NewGuid();
+        var payload = "{}"u8.ToArray();
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var oldResponse = await client.SendAsync(SignedRequest(deliveryId, payload, timestamp, "integration-test-secret"));
+        var newResponse = await client.SendAsync(SignedRequest(Guid.NewGuid(), payload, timestamp, replacement));
+
+        Assert.Equal(HttpStatusCode.NoContent, rotated.StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, oldResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, newResponse.StatusCode);
+    }
+
+    private HttpClient DevelopmentClient() => _factory.WithWebHostBuilder(builder => builder.UseEnvironment("Development")).CreateClient();
+
+    private static HttpRequestMessage SignedRequest(Guid id, byte[] payload, long timestamp, string secret)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/webhooks/relayforge") { Content = new ByteArrayContent(payload) };
+        request.Headers.Add("RelayForge-Delivery-Id", id.ToString("D"));
+        request.Headers.Add("RelayForge-Timestamp", timestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        request.Headers.Add("RelayForge-Signature", WebhookSigner.Sign(Encoding.UTF8.GetBytes(secret), timestamp, id, payload));
+        return request;
+    }
+}
+
 public sealed class UnstableReceiverFactory : WebApplicationFactory<RelayForge.UnstableReceiver.Program>
 {
     protected override void ConfigureWebHost(IWebHostBuilder builder)

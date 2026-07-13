@@ -11,7 +11,13 @@ public sealed class ReceiverOptions
     public int MaxBodyBytes { get; init; } = 65_536;
 }
 
-public sealed record ReceiverSigningConfiguration(
-    ReadOnlyMemory<byte> Secret,
-    TimeSpan TimestampTolerance,
-    int MaxBodyBytes);
+public sealed class ReceiverSigningConfiguration(byte[] secret, TimeSpan timestampTolerance, int maxBodyBytes)
+{
+    private byte[] _secret = secret;
+    public ReadOnlyMemory<byte> Secret => Volatile.Read(ref _secret);
+    public TimeSpan TimestampTolerance { get; } = timestampTolerance;
+    public int MaxBodyBytes { get; } = maxBodyBytes;
+    public void Rotate(byte[] secret) => Interlocked.Exchange(ref _secret, secret);
+}
+
+public sealed record RotateSecretRequest(string Secret);

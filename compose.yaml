@@ -1,19 +1,73 @@
+name: relayforge
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: relayforge
-      POSTGRES_USER: relayforge
-      POSTGRES_PASSWORD: relayforge
-    ports:
-      - "5432:5432"
-    volumes:
-      - relayforge-postgres:/var/lib/postgresql/data
+      POSTGRES_DB: ${POSTGRES_DB:-relayforge}
+      POSTGRES_USER: ${POSTGRES_USER:-relayforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relayforge-demo-only}
+    ports: ["${POSTGRES_PORT:-5433}:5432"]
+    volumes: ["relayforge-postgres:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U relayforge -d relayforge"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
       timeout: 3s
-      retries: 10
-
+      retries: 20
+  migrations:
+    build:
+      context: .
+      dockerfile: src/RelayForge.MigrationService/Dockerfile
+    environment:
+      ConnectionStrings__RelayForge: Host=postgres;Port=5432;Database=${POSTGRES_DB:-relayforge};Username=${POSTGRES_USER:-relayforge};Password=${POSTGRES_PASSWORD:-relayforge-demo-only}
+    depends_on:
+      postgres: { condition: service_healthy }
+  unstable-receiver:
+    build:
+      context: .
+      dockerfile: src/RelayForge.UnstableReceiver/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      Receiver__SigningSecret: ${RECEIVER_SIGNING_SECRET:-relayforge-demo-receiver-secret}
+    ports: ["${RECEIVER_PORT:-5001}:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  api:
+    build:
+      context: .
+      dockerfile: src/RelayForge.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__RelayForge: Host=postgres;Port=5432;Database=${POSTGRES_DB:-relayforge};Username=${POSTGRES_USER:-relayforge};Password=${POSTGRES_PASSWORD:-relayforge-demo-only}
+      DataProtection__KeysPath: /var/lib/relayforge/keys
+      OutboundDelivery__AllowedPrivateHosts__0: unstable-receiver
+      DeliveryWorker__PollInterval: 00:00:00.250
+    volumes: ["relayforge-keys:/var/lib/relayforge/keys"]
+    ports: ["${API_PORT:-5000}:8080"]
+    depends_on:
+      migrations: { condition: service_completed_successfully }
+      unstable-receiver: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  web:
+    build:
+      context: .
+      dockerfile: src/RelayForge.Web/Dockerfile
+    ports: ["${WEB_PORT:-5173}:8080"]
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 volumes:
   relayforge-postgres:
+  relayforge-keys:
