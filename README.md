@@ -10,6 +10,22 @@ Endpoint activity is checked under a PostgreSQL `FOR SHARE` row lock in the same
 
 Reliable webhook delivery and replay platform built with .NET 8 and React.
 
+## Outbound delivery security
+
+Outbound delivery resolves a hostname once inside `SocketsHttpHandler.ConnectCallback`, rejects the
+entire DNS answer set when any address is private or otherwise non-public, and connects directly to
+the selected validated IP while retaining the original hostname for the HTTP Host header and TLS SNI.
+Redirects and proxy/environment-proxy use are disabled. Connections are pooled for a bounded lifetime;
+each new pooled connection repeats this single-resolution validation, while reuse avoids DNS churn.
+
+Development may explicitly allow exact private hostnames such as `unstable-receiver` or `localhost`
+through `OutboundDelivery:AllowedPrivateHosts`. Wildcards and IP literals are not accepted, and any
+private-host allowlist outside Development fails startup validation.
+
+Responses use `ResponseHeadersRead` and are streamed into a bounded, control-character-sanitized
+snippet. Response headers, cookies, authorization values, signatures, protected endpoint secrets,
+and full request payloads are never included in that persisted snippet.
+
 RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.
 
 The projects target .NET 8 (`net8.0`). The repository quickstart requires the .NET SDK 10.0.301 or newer in the same feature band, as pinned by `global.json`, to support the `.slnx` solution format.

@@ -103,8 +103,8 @@ public sealed class Delivery
 public sealed class DeliveryAttempt
 {
     private DeliveryAttempt() { }
-    private DeliveryAttempt(Guid id, DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error)
-    { Id = id; DeliveryId = deliveryId; Number = number; StartedAt = startedAt; CompletedAt = completedAt; DurationMilliseconds = Math.Max(0, (long)(completedAt - startedAt).TotalMilliseconds); Outcome = outcome; HttpStatusCode = statusCode; Error = Sanitize(error); }
+    private DeliveryAttempt(Guid id, DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error, string? responseSnippet)
+    { Id = id; DeliveryId = deliveryId; Number = number; StartedAt = startedAt; CompletedAt = completedAt; DurationMilliseconds = Math.Max(0, (long)(completedAt - startedAt).TotalMilliseconds); Outcome = outcome; HttpStatusCode = statusCode; Error = Sanitize(error); ResponseSnippet = Sanitize(responseSnippet, 65_547); }
     public Guid Id { get; private set; }
     public DeliveryId DeliveryId { get; private set; }
     public int Number { get; private set; }
@@ -114,8 +114,9 @@ public sealed class DeliveryAttempt
     public DeliveryAttemptOutcome Outcome { get; private set; }
     public int? HttpStatusCode { get; private set; }
     public string? Error { get; private set; }
-    public static DeliveryAttempt Create(DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error) => new(Guid.NewGuid(), deliveryId, number, startedAt, completedAt, outcome, statusCode, error);
-    private static string? Sanitize(string? value) => string.IsNullOrWhiteSpace(value) ? null : new string(value.Where(c => !char.IsControl(c)).Take(1000).ToArray());
+    public string? ResponseSnippet { get; private set; }
+    public static DeliveryAttempt Create(DeliveryId deliveryId, int number, DateTimeOffset startedAt, DateTimeOffset completedAt, DeliveryAttemptOutcome outcome, int? statusCode, string? error, string? responseSnippet = null) => new(Guid.NewGuid(), deliveryId, number, startedAt, completedAt, outcome, statusCode, error, responseSnippet);
+    private static string? Sanitize(string? value, int limit = 1000) => string.IsNullOrWhiteSpace(value) ? null : new string(value.Where(c => !char.IsControl(c)).Take(limit).ToArray());
 }
 
 public static class EventFingerprint

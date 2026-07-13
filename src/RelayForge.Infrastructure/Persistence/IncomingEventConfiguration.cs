@@ -55,6 +55,7 @@ public sealed class DeliveryAttemptConfiguration : IEntityTypeConfiguration<Deli
         builder.Property(x => x.DeliveryId).HasConversion(x => x.Value, x => new(x));
         builder.Property(x => x.Outcome).HasConversion<string>().HasMaxLength(20);
         builder.Property(x => x.Error).HasMaxLength(1000);
+        builder.Property(x => x.ResponseSnippet).HasColumnName("response_snippet").HasMaxLength(65_547);
         builder.HasIndex(x => new { x.DeliveryId, x.Number }).IsUnique();
     }
 }

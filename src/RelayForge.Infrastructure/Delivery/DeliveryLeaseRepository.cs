@@ -63,7 +63,7 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
         return await FinalizeAsync(lease, startedAt, statusCode, failure.ReasonCode, decision, cancellationToken);
     }
 
-    public async Task<bool> FinalizeAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, string reasonCode, RetryDecision? decision, CancellationToken cancellationToken)
+    public async Task<bool> FinalizeAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, string reasonCode, RetryDecision? decision, CancellationToken cancellationToken, string? responseSnippet = null)
     {
         await using var db = await factory.CreateDbContextAsync(cancellationToken); await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         var success = decision is null; var target = decision switch { null => "Delivered", RetryDecision.Retry => "RetryScheduled", _ => "DeadLettered" };
@@ -76,7 +76,7 @@ public sealed class DeliveryLeaseRepository(IDbContextFactory<RelayForgeDbContex
             RETURNING clock_timestamp() AS "Value"
             """).ToListAsync(cancellationToken);
         if (completed.Count == 0) { await transaction.RollbackAsync(cancellationToken); return false; }
-        db.DeliveryAttempts.Add(DeliveryAttempt.Create(deliveryId, lease.AttemptNumber, startedAt, completed[0], success ? DeliveryAttemptOutcome.Delivered : DeliveryAttemptOutcome.Failed, statusCode, success ? null : reasonCode));
+        db.DeliveryAttempts.Add(DeliveryAttempt.Create(deliveryId, lease.AttemptNumber, startedAt, completed[0], success ? DeliveryAttemptOutcome.Delivered : DeliveryAttemptOutcome.Failed, statusCode, success ? null : reasonCode, responseSnippet));
         await db.SaveChangesAsync(cancellationToken); await transaction.CommitAsync(cancellationToken); return true;
     }
 

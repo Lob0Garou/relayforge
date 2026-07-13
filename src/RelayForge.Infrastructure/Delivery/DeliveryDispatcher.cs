@@ -11,11 +11,11 @@ public sealed class FinalizedDeliveryPolicyException(Guid deliveryId, Exception 
     public Guid DeliveryId { get; } = deliveryId;
 }
 
-public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttpClientFactory clients, IDataProtectionProvider protection, TimeProvider clock, RetryPolicy? retryPolicy = null)
+public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttpClientFactory clients, IDataProtectionProvider protection, TimeProvider clock, RetryPolicy? retryPolicy = null, OutboundDeliveryOptions? responseOptions = null)
 {
     public async Task DispatchAsync(DeliveryLease lease, CancellationToken cancellationToken)
     {
-        var startedAt = clock.GetUtcNow(); int? status = null; string? retryAfter = null; var failure = DeliveryFailureClassifier.Processing();
+        var startedAt = clock.GetUtcNow(); int? status = null; string? retryAfter = null; string? responseSnippet = null; var failure = DeliveryFailureClassifier.Processing();
         try
         {
             var body = Encoding.UTF8.GetBytes(lease.Payload);
@@ -29,6 +29,7 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); timeout.CancelAfter(lease.Timeout);
             using var response = await clients.CreateClient("RelayForgeDelivery").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             status = (int)response.StatusCode;
+            responseSnippet = await BoundedResponseReader.ReadAsync(response.Content, (responseOptions ?? new()).MaxResponseSnippetBytes, timeout.Token);
             failure = DeliveryFailureClassifier.FromHttpStatus(status.Value);
             retryAfter = response.Headers.RetryAfter?.ToString();
         }
@@ -44,7 +45,7 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
         catch (Exception) { failure = DeliveryFailureClassifier.Processing(); }
         var decision = failure.Kind == DeliveryFailureKind.Success ? null : await DecideAsync(lease, startedAt, status, failure, retryAfter);
         var reasonCode = decision is RetryDecision.DeadLetter deadLetter ? deadLetter.ReasonCode : failure.ReasonCode;
-        await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken);
+        await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken, responseSnippet);
     }
 
     private async Task<RetryDecision> DecideAsync(DeliveryLease lease, DateTimeOffset startedAt, int? statusCode, DeliveryFailure failure, string? retryAfter)

@@ -17,6 +17,7 @@ builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
     options.UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking);
 });
 builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<IDestinationResolver, SystemDestinationResolver>();
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
 builder.Services.AddSingleton<IJitterSource, SystemJitterSource>();
@@ -28,7 +29,26 @@ builder.Services.AddOptions<DeliveryWorkerOptions>().Bind(builder.Configuration.
     .Validate(x => x.PollInterval >= TimeSpan.FromMilliseconds(100) && x.PollInterval <= TimeSpan.FromMinutes(5), "PollInterval is out of range.")
     .Validate(x => x.LeaseDuration >= TimeSpan.FromSeconds(5) && x.LeaseDuration <= TimeSpan.FromMinutes(30), "LeaseDuration is out of range.")
     .ValidateOnStart();
-builder.Services.AddHttpClient("RelayForgeDelivery").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.AddOptions<OutboundDeliveryOptions>().Bind(builder.Configuration.GetSection("OutboundDelivery"))
+    .Validate(options =>
+    {
+        try { OutboundDeliveryOptions.Validate(options, builder.Environment.IsDevelopment()); return true; }
+        catch (InvalidOperationException) { return false; }
+    }, "Outbound delivery configuration is invalid or unsafe for this environment.")
+    .ValidateOnStart();
+builder.Services.AddSingleton(sp => sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<OutboundDeliveryOptions>>().Value);
+builder.Services.AddHttpClient("RelayForgeDelivery").ConfigurePrimaryHttpMessageHandler(sp =>
+{
+    var options = sp.GetRequiredService<OutboundDeliveryOptions>();
+    var connector = new DestinationConnector(new DestinationPolicy(options.AllowedPrivateHosts), sp.GetRequiredService<IDestinationResolver>());
+    return new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+        UseProxy = false,
+        PooledConnectionLifetime = options.PooledConnectionLifetime,
+        ConnectCallback = connector.ConnectAsync
+    };
+});
 builder.Services.AddHostedService<DeliveryWorker>();
 
 var keysPath = builder.Configuration["DataProtection:KeysPath"];
