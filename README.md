@@ -1,111 +1,97 @@
 # RelayForge
 
-## Event ingestion idempotency
+[![CI](https://github.com/Lob0Garou/relayforge/actions/workflows/ci.yml/badge.svg)](https://github.com/Lob0Garou/relayforge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`POST /api/events` uses a single-tenant, globally unique `Idempotency-Key` in the MVP. Replays with the same endpoint, event type, and semantically equivalent JSON payload return the original event and delivery IDs. Reusing the key for any different endpoint, event type, or payload returns `409 Conflict`.
+RelayForge is a self-hosted webhook delivery control plane built with .NET 8, PostgreSQL, and React. It accepts idempotent events, signs outbound requests, retries transient failures, exposes a dead-letter/replay workflow, and gives operators a compact delivery dashboard.
 
-JSON numbers are canonicalized exactly; equivalent spellings share a fingerprint, and negative zero is intentionally equivalent to zero.
+![RelayForge operations dashboard](docs/assets/dashboard.png)
 
-Endpoint activity is checked under a PostgreSQL `FOR SHARE` row lock in the same transaction that creates the event and delivery. Any future endpoint-deactivation path must first acquire `FOR UPDATE` (or another incompatible row lock) in its update transaction so ingestion and deactivation have a single database-defined order.
+## Run the local demo
 
-Reliable webhook delivery and replay platform built with .NET 8 and React.
+Requirements: Docker Desktop with Compose v2. The stack uses host ports `5173`, `5000`, and `5433` by default.
 
-## Outbound delivery security
+```powershell
+docker compose up --build -d --wait
+```
 
-Outbound delivery resolves a hostname once inside `SocketsHttpHandler.ConnectCallback`, rejects the
-entire DNS answer set when any address is private or otherwise non-public, and connects directly to
-the selected validated IP while retaining the original hostname for the HTTP Host header and TLS SNI.
-Redirects and proxy/environment-proxy use are disabled. Connections are pooled for a bounded lifetime;
-each new pooled connection repeats this single-resolution validation, while reuse avoids DNS churn.
-The pool lifetime is a deliberate upper bound, not DNS-TTL-aware: an existing connection may remain
-in use until that bound expires, and every replacement connection performs a fresh policy-gated resolution.
+Open <http://localhost:5173>, then run the deterministic API demo:
 
-Development may explicitly allow exact private hostnames such as `unstable-receiver` or `localhost`
-through `OutboundDelivery:AllowedPrivateHosts`. Wildcards and IP literals are not accepted, and any
-private-host allowlist outside Development fails startup validation.
+```powershell
+./scripts/demo.ps1
+```
 
-Responses use `ResponseHeadersRead` and are streamed into a bounded, control-character-sanitized
-snippet. Response headers, cookies, authorization values, signatures, protected endpoint secrets,
-and full request payloads are never included in that persisted snippet.
-The dispatcher also removes exact payload, signature, and signing-secret values echoed by a receiver.
-This value-based redaction cannot identify secrets unknown to RelayForge; the dispatcher therefore
-does not send Cookie or Authorization headers, and response headers such as Set-Cookie are never persisted.
+Stop only this project and delete its demo volumes:
 
-RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.
+```powershell
+docker compose down -v
+```
 
-The projects target .NET 8 (`net8.0`). The repository quickstart requires the .NET SDK 10.0.301 or newer in the same feature band, as pinned by `global.json`, to support the `.slnx` solution format.
+The Compose defaults are synthetic and intended only for an isolated development machine. Copy `.env.example` to `.env` to change ports or demo credentials. Never expose this v0.1 stack to an untrusted network: its operator APIs and the receiver's Development-only secret rotation control intentionally have no authentication.
 
-## Quickstart
+## Architecture
+
+```mermaid
+flowchart LR
+  Client -->|idempotent event| API[RelayForge API]
+  API --> PG[(PostgreSQL)]
+  Worker[Delivery worker] --> PG
+  Worker -->|HMAC signed webhook| Receiver[Receiver]
+  Web[React operator console] --> API
+  Migration[Migration service] --> PG
+```
+
+PostgreSQL is the source of truth. Event acceptance and delivery creation share a transaction; workers claim durable leases and persist every attempt. See [architecture](docs/architecture.md) and [guarantees](docs/guarantees.md).
+
+## What v0.1.0 provides
+
+- endpoint registration with one-time generated signing secrets;
+- global idempotency keys with canonical JSON fingerprints;
+- durable, at-least-once delivery with bounded concurrency;
+- HMAC-SHA256 signatures over timestamp, delivery ID, and exact body bytes;
+- capped exponential retry with jitter, dead letters, and manual replay;
+- SSRF controls: one DNS resolution per connection, public-address validation, no redirects or proxy use;
+- sanitized delivery diagnostics, health endpoints, and OpenTelemetry instruments;
+- a responsive operations dashboard and an intentionally unstable demo receiver.
+
+RelayForge does not promise exactly-once delivery, receiver-side deduplication, ordered delivery, or zero-loss operation after an acknowledged receiver response is lost. Read the precise contract in [guarantees](docs/guarantees.md).
+
+## Development and quality gates
+
+The repo pins SDK `10.0.301` to read the `.slnx`, while all projects target `net8.0`.
 
 ```powershell
 dotnet tool restore
-dotnet build RelayForge.slnx
-dotnet test RelayForge.slnx
-dotnet run --project src/RelayForge.Api
-```
+dotnet slopwatch --no-baseline --fail-on warning
+dotnet restore RelayForge.slnx --locked-mode
+dotnet build RelayForge.slnx -c Release --no-restore
+dotnet test RelayForge.slnx -c Release --no-build
 
-The live health endpoint is available at `/health/live`.
-Database and validated startup readiness is available at `/health/ready`. The local MVP operations APIs intentionally have no authentication and must not be exposed to an untrusted network. Dead-letter replay is available at `POST /api/dead-letters/{deliveryId}/replay` in this local no-auth mode. Operational success/failure rates and latency use a documented rolling 24-hour attempt window.
-
-### Operations dashboard
-
-Run the API, then start the Vite operator console in a second PowerShell window:
-
-```powershell
 Set-Location src/RelayForge.Web
 npm.cmd ci
-npm.cmd run dev
+npm.cmd audit --audit-level=high
+npm.cmd run lint
+npm.cmd run typecheck
+npm.cmd test
+npm.cmd run build
+npx.cmd playwright install chromium
+npm.cmd run test:e2e
 ```
 
-The development server proxies `/api` and `/health` to `http://localhost:5000`. Override that target with `VITE_API_PROXY_TARGET` when the API listens elsewhere. Production deployments can set `VITE_API_BASE_URL` or serve both applications under the same origin. The dashboard uses only the sanitized operations APIs; do not expose the unauthenticated MVP operations surface to an untrusted network.
+Integration tests and CI use disposable PostgreSQL Testcontainers. See the [demo guide](docs/demo.md) for a guided failure/replay walkthrough.
 
-### Data Protection outside Development
+## Security model
 
-Production-like environments must mount a persistent keyring shared by all application instances and an X509 certificate/private key pair in PEM format. Configure these values through environment variables; never commit the certificate or private key:
+Endpoint secrets are generated once and stored through ASP.NET Core Data Protection. The demo persists its keyring in a named Docker volume. Non-development deployments must provide persistent keys protected by an X509 certificate and must add authentication, authorization, TLS termination, network isolation, secret management, backups, and production observability before exposure.
 
-```powershell
-$env:DataProtection__KeysPath = 'C:\relayforge\keyring'
-$env:DataProtection__CertificatePath = 'C:\run\secrets\data-protection.crt.pem'
-$env:DataProtection__PrivateKeyPath = 'C:\run\secrets\data-protection.key.pem'
-```
+Outbound private-host allowlisting is accepted only in `Development`; Compose allows exactly `unstable-receiver`. Wildcards and IP literals are rejected.
 
-The local unprotected keyring fallback is enabled only in the `Development` environment.
+## Roadmap
 
-## Webhook signature protocol and failure simulator
+- authenticated multi-tenant operator access;
+- secret rotation and receiver verification tooling;
+- delivery ordering controls and rate limiting;
+- production deployment manifests and backup/restore guidance;
+- richer alerting and trace correlation.
 
-RelayForge webhook signatures use HMAC-SHA256. The signed bytes are exactly the UTF-8 bytes of
-`{unixTimestamp}.{deliveryId}.` followed by the raw request body bytes, with no JSON parsing or
-canonicalization. Delivery IDs use canonical lowercase GUID `D` format, making the dot-delimited
-frame unambiguous. The signature header is lowercase `sha256=<hex>`. Binding the timestamp and
-delivery ID to the exact payload detects mutation and, together with an enforced timestamp window,
-limits replay but does not prevent it. Receivers compare signatures in constant time.
-
-The standalone simulator can be run locally with its clearly synthetic Development secret:
-
-```powershell
-dotnet run --project src/RelayForge.UnstableReceiver
-```
-
-Configure its bounded failure scenario with `PUT /operations/scenario`; each reconfiguration
-atomically clears the prior attempt counters. Status codes 400-599 are intentionally accepted so
-the simulator can model both terminal and transient failures. Send signed raw bodies to
-`POST /webhooks/relayforge`, and inspect attempts at `GET /operations/deliveries/{deliveryId}`.
-
-Delivery failures use five total attempts by default. Transient failures are scheduled by PostgreSQL with capped exponential backoff and jitter; permanent failures and exhausted transient failures are dead-lettered. Operators can list sanitized dead letters at `GET /api/dead-letters` and replay an eligible delivery with the local-only replay endpoint documented above.
-For any non-Development environment set `Receiver__SigningSecret` through configuration or the
-environment. The simulator's state is deliberately thread-safe but in-memory and process-local: it
-is a demo receiver, not a broker, durable queue, or delivery source of truth.
-
-## Planned capabilities
-
-- Idempotent event ingestion
-- Durable at-least-once delivery
-- Outbound HMAC signing in the delivery worker
-- Retries with exponential backoff and jitter
-- Dead-letter queue and manual replay
-- Operational dashboard and OpenTelemetry
-
-## Status
-
-Early development. The repository will remain runnable at each published milestone.
-
+See [release notes](RELEASE_NOTES.md). Licensed under [MIT](LICENSE).
