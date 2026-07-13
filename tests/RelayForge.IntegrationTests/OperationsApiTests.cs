@@ -22,7 +22,7 @@ public sealed class OperationsApiTests(PostgreSqlFixture fixture)
         using var client = fixture.Factory.CreateClient();
 
         using var overview = await client.GetAsync("/api/operations/overview");
-        using var events = await client.GetAsync($"/api/events?page=2147483647&pageSize=9999&type=secret.event&status=DeadLettered&endpointId={endpoint.Id.Value}");
+        using var events = await client.GetAsync($"/api/events?page=1&pageSize=9999&type=secret.event&status=DeadLettered&endpointId={endpoint.Id.Value}");
         using var detail = await client.GetAsync($"/api/deliveries/{incoming.Delivery.Id.Value}");
         using var ready = await client.GetAsync("/health/ready");
 
@@ -37,6 +37,14 @@ public sealed class OperationsApiTests(PostgreSqlFixture fixture)
         Assert.DoesNotContain("idempotency", text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("safe snippet", text);
         Assert.Contains("\"pageSize\":100", await events.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Event_and_dead_letter_pagination_rejects_extreme_pages()
+    {
+        using var client = fixture.Factory.CreateClient();
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync("/api/events?page=1001&pageSize=20")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync("/api/dead-letters?page=1001&pageSize=20")).StatusCode);
     }
 
     [Fact]

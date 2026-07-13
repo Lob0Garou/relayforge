@@ -17,7 +17,7 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
     public async Task DispatchAsync(DeliveryLease lease, CancellationToken cancellationToken)
     {
         using var activity = RelayForgeTelemetry.ActivitySource.StartActivity("delivery.dispatch_attempt");
-        activity?.SetTag("delivery.id", lease.DeliveryId.ToString("D")); activity?.SetTag("attempt.number", lease.AttemptNumber);
+        activity?.SetTag("attempt.number", lease.AttemptNumber);
         var startedAt = clock.GetUtcNow(); int? status = null; string? retryAfter = null; string? responseSnippet = null; var failure = DeliveryFailureClassifier.Processing();
         try
         {
@@ -49,7 +49,13 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
         catch (Exception) { failure = DeliveryFailureClassifier.Processing(); }
         var decision = failure.Kind == DeliveryFailureKind.Success ? null : await DecideAsync(lease, startedAt, status, failure, retryAfter);
         var reasonCode = decision is RetryDecision.DeadLetter deadLetter ? deadLetter.ReasonCode : failure.ReasonCode;
-        await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken, responseSnippet);
+        var finalized = await repository.FinalizeAsync(lease, startedAt, status, reasonCode, decision, cancellationToken, responseSnippet);
+        if (!finalized)
+        {
+            activity?.SetTag("outcome", "finalize_rejected");
+            RelayForgeTelemetry.FinalizationRejected.Add(1);
+            return;
+        }
         var outcome = decision switch { null => "delivered", RetryDecision.Retry => "retry", _ => "dead_lettered" };
         activity?.SetTag("outcome", outcome); RelayForgeTelemetry.DeliveryOutcomes.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
         RelayForgeTelemetry.DeliveryDuration.Record(Math.Max(0, (clock.GetUtcNow() - startedAt).TotalMilliseconds), new KeyValuePair<string, object?>("outcome", outcome));

@@ -31,6 +31,7 @@ public static class OperationsRoutes
     private static async Task<IResult> EventsAsync(int? page, int? pageSize, string? type, string? status, Guid? endpointId, IDbContextFactory<RelayForgeDbContext> factory, CancellationToken token)
     {
         var p = Math.Max(1, page ?? 1); var size = Math.Clamp(pageSize ?? 20, 1, 100);
+        if (page is > 1000) return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Page must not exceed 1000."] });
         if (!string.IsNullOrWhiteSpace(status) && !Enum.TryParse<DeliveryStatus>(status, true, out _)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["status"] = ["Unknown delivery status."] });
         await using var db = await factory.CreateDbContextAsync(token);
         var endpointKey = endpointId is { } value ? new RelayForge.Domain.Endpoints.WebhookEndpointId(value) : default;

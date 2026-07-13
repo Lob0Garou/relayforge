@@ -10,6 +10,7 @@ public static class DeadLetterRoutes
     {
         routes.MapGet("/api/dead-letters", async (int? page, int? pageSize, IDbContextFactory<RelayForgeDbContext> factory, CancellationToken token) =>
         {
+            if (page is > 1000) return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Page must not exceed 1000."] });
             var safePage = Math.Max(1, page ?? 1); var safeSize = Math.Clamp(pageSize ?? 20, 1, 100);
             await using var db = await factory.CreateDbContextAsync(token);
             var query = db.Deliveries.AsNoTracking().Where(x => x.Status == DeliveryStatus.DeadLettered);
