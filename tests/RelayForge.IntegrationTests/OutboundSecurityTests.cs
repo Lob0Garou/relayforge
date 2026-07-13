@@ -80,6 +80,18 @@ public sealed class OutboundSecurityTests
     public void Cidr_boundaries_are_matched_exactly(string address, bool expected) =>
         Assert.Equal(expected, DestinationPolicy.IsPublicAddress(IPAddress.Parse(address)));
 
+    [Theory]
+    [InlineData("3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false)]
+    [InlineData("3fff::", false)]
+    [InlineData("3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", false)]
+    [InlineData("3fff:1000::", true)]
+    [InlineData("2620:4f:7fff:ffff:ffff:ffff:ffff:ffff", true)]
+    [InlineData("2620:4f:8000::", false)]
+    [InlineData("2620:4f:8000:ffff:ffff:ffff:ffff:ffff", false)]
+    [InlineData("2620:4f:8001::", true)]
+    public void Selected_ipv6_special_purpose_boundaries_are_fail_closed(string address, bool expected) =>
+        Assert.Equal(expected, DestinationPolicy.IsPublicAddress(IPAddress.Parse(address)));
+
     [Fact]
     public async Task Mixed_dns_answers_fail_closed_and_rebinding_resolver_is_called_once()
     {
