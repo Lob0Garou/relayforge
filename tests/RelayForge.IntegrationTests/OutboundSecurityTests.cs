@@ -2,6 +2,12 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using RelayForge.Infrastructure.Delivery;
 
 namespace RelayForge.IntegrationTests;
@@ -13,7 +19,14 @@ public sealed class OutboundSecurityTests
         "0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "192.168.1.1",
         "192.0.2.1", "198.18.0.1", "198.51.100.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
         "::", "::1", "fe80::1", "fec0::1", "fc00::1", "ff02::1", "2001:db8::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1"
+        , "100::1", "2001:2::1", "3ffe::1", "2001::1", "2002::1"
     };
+
+    [Theory]
+    [InlineData("2606:4700::1111")]
+    [InlineData("2001:4860:4860::8888")]
+    public void Destination_policy_accepts_global_unicast_addresses(string value) =>
+        Assert.True(DestinationPolicy.IsPublicAddress(IPAddress.Parse(value)));
 
     [Theory]
     [MemberData(nameof(ForbiddenAddresses))]
@@ -75,6 +88,65 @@ public sealed class OutboundSecurityTests
         Assert.Equal(1, publicThenPrivate.Calls);
     }
 
+    [Fact]
+    public async Task Configured_http_client_denies_private_by_default_before_low_level_connect()
+    {
+        var resolver = new AlternatingResolver([IPAddress.Loopback]);
+        var lowLevel = new RecordingAddressConnector();
+        using var app = new RelayForgeApiFactory().WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+        {
+            services.AddSingleton<IDestinationResolver>(resolver);
+            services.AddSingleton<IAddressConnector>(lowLevel);
+        }));
+        var client = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient("RelayForgeDelivery");
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync("http://blocked.test/hook"));
+        Assert.Equal(1, resolver.Calls);
+        Assert.Equal(0, lowLevel.Calls);
+    }
+
+    [Fact]
+    public async Task Configured_http_client_rejects_mixed_dns_before_connector_and_resolves_once()
+    {
+        var resolver = new AlternatingResolver([IPAddress.Parse("93.184.216.34"), IPAddress.Loopback], [IPAddress.Parse("93.184.216.34")]);
+        var lowLevel = new RecordingAddressConnector();
+        using var app = new RelayForgeApiFactory().WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+        {
+            services.AddSingleton<IDestinationResolver>(resolver);
+            services.AddSingleton<IAddressConnector>(lowLevel);
+        }));
+        var client = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient("RelayForgeDelivery");
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync("http://mixed.test/hook"));
+        Assert.Equal(1, resolver.Calls);
+        Assert.Equal(0, lowLevel.Calls);
+    }
+
+    [Fact]
+    public async Task Configured_development_client_allows_exact_host_preserves_host_and_does_not_follow_redirect()
+    {
+        await using var server = new SingleResponseServer("HTTP/1.1 302 Found\r\nLocation: http://localhost/second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        var resolver = new AlternatingResolver([IPAddress.Loopback], [IPAddress.Parse("10.0.0.1")]);
+        using var app = new RelayForgeApiFactory().WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+            services.AddSingleton<IDestinationResolver>(resolver)));
+        var client = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient("RelayForgeDelivery");
+        using var response = await client.GetAsync($"http://localhost:{server.Port}/first");
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Contains($"Host: localhost:{server.Port}", await server.Request);
+        Assert.Equal(1, resolver.Calls);
+    }
+
+    [Fact]
+    public async Task Connector_preserves_https_hostname_and_port_for_tls_sni_and_uses_first_validated_ip()
+    {
+        var resolver = new AlternatingResolver([IPAddress.Parse("2606:4700::1111")], [IPAddress.Loopback]);
+        var lowLevel = new RecordingAddressConnector();
+        var connector = new DestinationConnector(new DestinationPolicy([]), resolver, lowLevel);
+        await connector.ConnectAsync(new DnsEndPoint("secure.example", 8443), default);
+        Assert.Equal(IPAddress.Parse("2606:4700::1111"), lowLevel.Address);
+        Assert.Equal("secure.example", lowLevel.EndPoint!.Host);
+        Assert.Equal(8443, lowLevel.EndPoint.Port);
+        Assert.Equal(1, resolver.Calls);
+    }
+
     [Theory]
     [InlineData(8, "12345678", false)]
     [InlineData(8, "12345678[truncated]", true)]
@@ -101,6 +173,52 @@ public sealed class OutboundSecurityTests
     }
 
     [Fact]
+    public async Task Response_reader_redacts_known_values_even_when_echoed_bare_or_with_controls()
+    {
+        string[] sensitive = ["SECRET-VALUE", "sha256=SIGNATURE", "{\"payload\":true}", "cookie=KNOWN"];
+        using var content = new StringContent("SECRET-VALUE sha256=SIGN\tAT\0URE {\"payload\":true} cookie=KNOWN");
+        var snippet = await BoundedResponseReader.ReadAsync(content, 256, sensitive, default);
+        Assert.DoesNotContain("SECRET", snippet);
+        Assert.DoesNotContain("SIGNATURE", snippet);
+        Assert.DoesNotContain("payload", snippet);
+        Assert.DoesNotContain("KNOWN", snippet);
+    }
+
+    [Fact]
+    public async Task Response_reader_redacts_sensitive_prefix_cut_by_the_byte_limit()
+    {
+        var sensitive = "SECRET-" + new string('x', 128);
+        using var content = new StringContent("prefix:" + sensitive);
+        var snippet = await BoundedResponseReader.ReadAsync(content, 24, [sensitive], default);
+        Assert.Equal("prefix:[redacted][truncated]", snippet);
+    }
+
+    [Fact]
+    public async Task Configured_https_client_emits_original_hostname_as_sni()
+    {
+        await using var server = new SniCaptureServer();
+        var resolver = new AlternatingResolver([IPAddress.Loopback]);
+        using var app = new RelayForgeApiFactory().WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+            services.AddSingleton<IDestinationResolver>(resolver)));
+        var client = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient("RelayForgeDelivery");
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync($"https://localhost:{server.Port}/hook"));
+        Assert.Equal("localhost", await server.ServerName);
+        Assert.Equal(1, resolver.Calls);
+    }
+
+    [Fact]
+    public async Task Response_reader_observes_cancellation_while_streaming()
+    {
+        var stream = new SignaledBlockingStream();
+        using var content = new StreamContent(stream);
+        using var cancellation = new CancellationTokenSource();
+        var read = BoundedResponseReader.ReadAsync(content, 16, cancellation.Token);
+        await stream.ReadStarted.Task;
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read);
+    }
+
+    [Fact]
     public void Outbound_options_reject_invalid_limits_and_private_allowlist_outside_development()
     {
         Assert.Throws<InvalidOperationException>(() => OutboundDeliveryOptions.Validate(new() { MaxResponseSnippetBytes = 0 }, true));
@@ -113,5 +231,61 @@ public sealed class OutboundSecurityTests
         public int Calls => _calls;
         public ValueTask<IPAddress[]> ResolveAsync(string host, CancellationToken cancellationToken) =>
             ValueTask.FromResult(answers[Math.Min(Interlocked.Increment(ref _calls) - 1, answers.Length - 1)]);
+    }
+
+    private sealed class SignaledBlockingStream : Stream
+    {
+        private readonly TaskCompletionSource _never = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public override bool CanRead => true; public override bool CanSeek => false; public override bool CanWrite => false; public override long Length => throw new NotSupportedException(); public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) { ReadStarted.TrySetResult(); await _never.Task.WaitAsync(cancellationToken); return 0; }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException(); public override void Flush() => throw new NotSupportedException(); public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException(); public override void SetLength(long value) => throw new NotSupportedException(); public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class RecordingAddressConnector : IAddressConnector
+    {
+        public int Calls { get; private set; } public IPAddress? Address { get; private set; } public DnsEndPoint? EndPoint { get; private set; }
+        public ValueTask<Stream> ConnectAsync(IPAddress address, DnsEndPoint originalEndPoint, CancellationToken cancellationToken) { Calls++; Address = address; EndPoint = originalEndPoint; return ValueTask.FromResult<Stream>(new MemoryStream()); }
+    }
+
+    private sealed class SingleResponseServer : IAsyncDisposable
+    {
+        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly string _response;
+        public SingleResponseServer(string response) { _response = response; _listener.Start(); Port = ((IPEndPoint)_listener.LocalEndpoint).Port; Request = ServeAsync(); }
+        public int Port { get; }
+        public Task<string> Request { get; }
+        private async Task<string> ServeAsync()
+        {
+            using var client = await _listener.AcceptTcpClientAsync(); await using var stream = client.GetStream();
+            var buffer = new byte[4096]; var read = await stream.ReadAsync(buffer); var request = Encoding.ASCII.GetString(buffer, 0, read);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(_response)); return request;
+        }
+        public ValueTask DisposeAsync() { _listener.Stop(); return ValueTask.CompletedTask; }
+    }
+
+    private sealed class SniCaptureServer : IAsyncDisposable
+    {
+        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly X509Certificate2 _certificate;
+        public SniCaptureServer()
+        {
+            using var key = RSA.Create(2048); var request = new CertificateRequest("CN=localhost", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            _certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddMinutes(5));
+            _listener.Start(); Port = ((IPEndPoint)_listener.LocalEndpoint).Port; ServerName = CaptureAsync();
+        }
+        public int Port { get; }
+        public Task<string?> ServerName { get; }
+        private async Task<string?> CaptureAsync()
+        {
+            using var client = await _listener.AcceptTcpClientAsync(); await using var ssl = new SslStream(client.GetStream()); string? serverName = null;
+            try
+            {
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificateSelectionCallback = (_, name) => { serverName = name; return _certificate; }, EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13 });
+            }
+            catch (AuthenticationException) when (serverName is not null) { return serverName; }
+            return serverName;
+        }
+        public ValueTask DisposeAsync() { _listener.Stop(); _certificate.Dispose(); return ValueTask.CompletedTask; }
     }
 }

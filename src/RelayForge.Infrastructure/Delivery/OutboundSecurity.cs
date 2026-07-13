@@ -61,10 +61,11 @@ public sealed class DestinationPolicy
         if (address.AddressFamily == AddressFamily.InterNetworkV6)
         {
             var bytes = address.GetAddressBytes();
-            return !address.Equals(IPAddress.IPv6Any) && !address.Equals(IPAddress.IPv6Loopback) &&
-                   !address.IsIPv6LinkLocal && !address.IsIPv6SiteLocal && !address.IsIPv6Multicast &&
-                   (bytes[0] & 0xfe) != 0xfc &&
-                   !(bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8);
+            return MatchesPrefix(bytes, [0x20], 3) &&
+                   !MatchesPrefix(bytes, [0x20, 0x01, 0x00], 23) &&
+                   !MatchesPrefix(bytes, [0x20, 0x01, 0x0d, 0xb8], 32) &&
+                   !MatchesPrefix(bytes, [0x20, 0x02], 16) &&
+                   !MatchesPrefix(bytes, [0x3f, 0xfe], 16);
         }
         if (address.AddressFamily != AddressFamily.InterNetwork) return false;
         var b = address.GetAddressBytes();
@@ -81,6 +82,16 @@ public sealed class DestinationPolicy
             _ => true
         };
     }
+
+    private static bool MatchesPrefix(ReadOnlySpan<byte> address, ReadOnlySpan<byte> prefix, int prefixLength)
+    {
+        var wholeBytes = prefixLength / 8;
+        if (!address[..wholeBytes].SequenceEqual(prefix[..wholeBytes])) return false;
+        var remainingBits = prefixLength % 8;
+        if (remainingBits == 0) return true;
+        var mask = (byte)(0xff << (8 - remainingBits));
+        return (address[wholeBytes] & mask) == (prefix[wholeBytes] & mask);
+    }
 }
 
 public interface IDestinationResolver
@@ -96,31 +107,19 @@ public sealed class SystemDestinationResolver : IDestinationResolver
 
 public delegate ValueTask<Stream> PublicAddressConnector(IPAddress address, int port, CancellationToken cancellationToken);
 
-public sealed class DestinationConnector(DestinationPolicy policy, IDestinationResolver resolver, PublicAddressConnector? connect = null)
+public interface IAddressConnector
 {
-    private readonly PublicAddressConnector _connect = connect ?? ConnectSocketAsync;
+    ValueTask<Stream> ConnectAsync(IPAddress address, DnsEndPoint originalEndPoint, CancellationToken cancellationToken);
+}
 
-    public async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
-        => await ConnectAsync(context.DnsEndPoint, cancellationToken);
-
-    public async ValueTask<Stream> ConnectAsync(DnsEndPoint endPoint, CancellationToken cancellationToken)
-    {
-        var uri = new UriBuilder("http", endPoint.Host, endPoint.Port).Uri;
-        var decision = policy.Evaluate(uri);
-        if (!decision.Allowed) throw new HttpRequestException("destination_denied");
-        var addresses = await resolver.ResolveAsync(decision.Host, cancellationToken);
-        if (addresses.Length == 0 || addresses.Any(address => !DestinationPolicy.IsPublicAddress(address) && !decision.AllowsPrivateAddresses))
-            throw new HttpRequestException("destination_denied");
-        var selected = addresses.FirstOrDefault(DestinationPolicy.IsPublicAddress) ?? addresses[0];
-        return await _connect(selected, endPoint.Port, cancellationToken);
-    }
-
-    private static async ValueTask<Stream> ConnectSocketAsync(IPAddress address, int port, CancellationToken cancellationToken)
+public sealed class SocketAddressConnector : IAddressConnector
+{
+    public async ValueTask<Stream> ConnectAsync(IPAddress address, DnsEndPoint originalEndPoint, CancellationToken cancellationToken)
     {
         var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
         try
         {
-            await socket.ConnectAsync(new IPEndPoint(address, port), cancellationToken);
+            await socket.ConnectAsync(new IPEndPoint(address, originalEndPoint.Port), cancellationToken);
             return new NetworkStream(socket, ownsSocket: true);
         }
         catch
@@ -128,6 +127,39 @@ public sealed class DestinationConnector(DestinationPolicy policy, IDestinationR
             socket.Dispose();
             throw;
         }
+    }
+}
+
+public sealed class DestinationConnector
+{
+    private readonly DestinationPolicy _policy;
+    private readonly IDestinationResolver _resolver;
+    private readonly IAddressConnector _connect;
+
+    public DestinationConnector(DestinationPolicy policy, IDestinationResolver resolver, IAddressConnector connect)
+    { _policy = policy; _resolver = resolver; _connect = connect; }
+
+    public DestinationConnector(DestinationPolicy policy, IDestinationResolver resolver, PublicAddressConnector connect)
+        : this(policy, resolver, new DelegateAddressConnector(connect)) { }
+
+    public async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        => await ConnectAsync(context.DnsEndPoint, cancellationToken);
+
+    public async ValueTask<Stream> ConnectAsync(DnsEndPoint endPoint, CancellationToken cancellationToken)
+    {
+        var uri = new UriBuilder("http", endPoint.Host, endPoint.Port).Uri;
+        var decision = _policy.Evaluate(uri);
+        if (!decision.Allowed) throw new HttpRequestException("destination_denied");
+        var addresses = await _resolver.ResolveAsync(decision.Host, cancellationToken);
+        if (addresses.Length == 0 || addresses.Any(address => !DestinationPolicy.IsPublicAddress(address) && !decision.AllowsPrivateAddresses))
+            throw new HttpRequestException("destination_denied");
+        var selected = addresses.FirstOrDefault(DestinationPolicy.IsPublicAddress) ?? addresses[0];
+        return await _connect.ConnectAsync(selected, endPoint, cancellationToken);
+    }
+
+    private sealed class DelegateAddressConnector(PublicAddressConnector connect) : IAddressConnector
+    {
+        public ValueTask<Stream> ConnectAsync(IPAddress address, DnsEndPoint originalEndPoint, CancellationToken cancellationToken) => connect(address, originalEndPoint.Port, cancellationToken);
     }
 }
 
@@ -139,6 +171,9 @@ public static class BoundedResponseReader
         RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
 
     public static async Task<string?> ReadAsync(HttpContent content, int byteLimit, CancellationToken cancellationToken)
+        => await ReadAsync(content, byteLimit, [], cancellationToken);
+
+    public static async Task<string?> ReadAsync(HttpContent content, int byteLimit, IEnumerable<string> sensitiveValues, CancellationToken cancellationToken)
     {
         await using var stream = await content.ReadAsStreamAsync(cancellationToken);
         var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(byteLimit + 1, 8192));
@@ -155,11 +190,28 @@ public static class BoundedResponseReader
             }
             var truncated = output.Length == byteLimit && remaining == 0;
             var text = Encoding.UTF8.GetString(output.GetBuffer(), 0, (int)output.Length);
-            var normalized = new string(text.Where(c => !char.IsControl(c) || c is '\r' or '\n' or '\t').ToArray());
+            var normalized = new string(text.Where(c => !char.IsControl(c)).ToArray());
             var redacted = SensitiveHeaderLikeContent.Replace(normalized, "[redacted]");
+            foreach (var sensitiveValue in sensitiveValues)
+            {
+                var normalizedSensitiveValue = new string(sensitiveValue.Where(c => !char.IsControl(c)).ToArray());
+                if (normalizedSensitiveValue.Length != 0) redacted = RedactKnownValue(redacted, normalizedSensitiveValue);
+            }
             var sanitized = new string(redacted.Where(c => !char.IsControl(c) || c is '\t').ToArray());
             return sanitized.Length == 0 && !truncated ? null : sanitized + (truncated ? TruncatedMarker : string.Empty);
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }
+    }
+
+    private static string RedactKnownValue(string text, string sensitiveValue)
+    {
+        var redacted = text.Replace(sensitiveValue, "[redacted]", StringComparison.Ordinal);
+        var maximumPrefix = Math.Min(redacted.Length, sensitiveValue.Length - 1);
+        for (var length = maximumPrefix; length > 0; length--)
+        {
+            if (redacted.AsSpan().EndsWith(sensitiveValue.AsSpan(0, length), StringComparison.Ordinal))
+                return string.Concat(redacted.AsSpan(0, redacted.Length - length), "[redacted]");
+        }
+        return redacted;
     }
 }

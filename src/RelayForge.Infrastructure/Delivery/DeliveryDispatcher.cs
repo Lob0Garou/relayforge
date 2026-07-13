@@ -25,11 +25,12 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             request.Content.Headers.ContentType = new("application/json");
             request.Headers.Add("X-RelayForge-Delivery", lease.DeliveryId.ToString("D"));
             request.Headers.Add("X-RelayForge-Timestamp", timestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            request.Headers.Add("X-RelayForge-Signature", WebhookSigner.Sign(Encoding.UTF8.GetBytes(secret), timestamp, lease.DeliveryId, body));
+            var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(secret), timestamp, lease.DeliveryId, body);
+            request.Headers.Add("X-RelayForge-Signature", signature);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); timeout.CancelAfter(lease.Timeout);
             using var response = await clients.CreateClient("RelayForgeDelivery").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             status = (int)response.StatusCode;
-            responseSnippet = await BoundedResponseReader.ReadAsync(response.Content, (responseOptions ?? new()).MaxResponseSnippetBytes, timeout.Token);
+            responseSnippet = await BoundedResponseReader.ReadAsync(response.Content, (responseOptions ?? new()).MaxResponseSnippetBytes, [lease.Payload, signature, secret], timeout.Token);
             failure = DeliveryFailureClassifier.FromHttpStatus(status.Value);
             retryAfter = response.Headers.RetryAfter?.ToString();
         }

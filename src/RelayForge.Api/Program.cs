@@ -18,6 +18,7 @@ builder.Services.AddDbContextFactory<RelayForgeDbContext>(options =>
 });
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IDestinationResolver, SystemDestinationResolver>();
+builder.Services.AddSingleton<IAddressConnector, SocketAddressConnector>();
 builder.Services.AddScoped<DeliveryLeaseRepository>();
 builder.Services.AddScoped<DeliveryDispatcher>();
 builder.Services.AddSingleton<IJitterSource, SystemJitterSource>();
@@ -40,7 +41,7 @@ builder.Services.AddSingleton(sp => sp.GetRequiredService<Microsoft.Extensions.O
 builder.Services.AddHttpClient("RelayForgeDelivery").ConfigurePrimaryHttpMessageHandler(sp =>
 {
     var options = sp.GetRequiredService<OutboundDeliveryOptions>();
-    var connector = new DestinationConnector(new DestinationPolicy(options.AllowedPrivateHosts), sp.GetRequiredService<IDestinationResolver>());
+    var connector = new DestinationConnector(new DestinationPolicy(options.AllowedPrivateHosts), sp.GetRequiredService<IDestinationResolver>(), sp.GetRequiredService<IAddressConnector>());
     return new SocketsHttpHandler
     {
         AllowAutoRedirect = false,

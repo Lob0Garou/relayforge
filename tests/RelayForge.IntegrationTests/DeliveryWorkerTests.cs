@@ -169,6 +169,20 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     }
 
     [Fact]
+    public async Task Dispatcher_redacts_echoed_payload_signature_and_secret_before_database_persistence()
+    {
+        await fixture.ResetAsync(); var secret = await SeedAsync(); var repository = Repository();
+        var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
+        await new DeliveryDispatcher(repository, new SingleClientFactory(new EchoSensitiveHandler(secret)), fixture.Factory.Services.GetRequiredService<IDataProtectionProvider>(), TimeProvider.System)
+            .DispatchAsync(lease, default);
+        await using var db = await Factory().CreateDbContextAsync();
+        var snippet = Assert.Single(await db.DeliveryAttempts.ToListAsync()).ResponseSnippet!;
+        Assert.DoesNotContain(secret, snippet);
+        Assert.DoesNotContain(lease.Payload, snippet);
+        Assert.DoesNotContain("sha256=", snippet);
+    }
+
+    [Fact]
     public async Task Network_failure_is_recorded_once_as_retry_scheduled()
     {
         await fixture.ResetAsync(); await SeedAsync(); var repository = Repository(); var lease = Assert.Single(await repository.ClaimAsync(1, TimeSpan.FromMinutes(1), default));
@@ -465,6 +479,7 @@ public sealed class DeliveryWorkerTests(PostgreSqlFixture fixture)
     private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }
     private sealed class RetryAfterHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests); response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(120)); return Task.FromResult(response); } }
     private sealed class BodyHandler(string body, string cookie) : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var response = new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent(body) }; response.Headers.Add("Set-Cookie", cookie); return Task.FromResult(response); } }
+    private sealed class EchoSensitiveHandler(string secret) : HttpMessageHandler { protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) { var payload = await request.Content!.ReadAsStringAsync(cancellationToken); var signature = Assert.Single(request.Headers.GetValues("X-RelayForge-Signature")); return new(HttpStatusCode.BadRequest) { Content = new StringContent($"{payload}|{signature}|{secret}") }; } }
     private sealed class ThrowingJitter : RelayForge.Domain.Retry.IJitterSource { public double NextUnit() => throw new InvalidOperationException("policy defect details"); }
     private sealed class FirstThrowJitter : RelayForge.Domain.Retry.IJitterSource { private int _calls; public double NextUnit() => Interlocked.Increment(ref _calls) == 1 ? throw new InvalidOperationException("sensitive policy details") : .5; }
     private sealed class SequencedResponseHandler(params HttpStatusCode[] statuses) : HttpMessageHandler { private int _calls; protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(statuses[Interlocked.Increment(ref _calls) - 1])); }

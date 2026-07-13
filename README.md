@@ -25,6 +25,9 @@ private-host allowlist outside Development fails startup validation.
 Responses use `ResponseHeadersRead` and are streamed into a bounded, control-character-sanitized
 snippet. Response headers, cookies, authorization values, signatures, protected endpoint secrets,
 and full request payloads are never included in that persisted snippet.
+The dispatcher also removes exact payload, signature, and signing-secret values echoed by a receiver.
+This value-based redaction cannot identify secrets unknown to RelayForge; the dispatcher therefore
+does not send Cookie or Authorization headers, and response headers such as Set-Cookie are never persisted.
 
 RelayForge is being developed in public through small, verifiable milestones. The first executable foundation is available.
 
