@@ -6,7 +6,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-relayforge}
       POSTGRES_USER: ${POSTGRES_USER:-relayforge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relayforge-demo-only}
-    ports: ["${POSTGRES_PORT:-5433}:5432"]
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5433}:5432"]
     volumes: ["relayforge-postgres:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
@@ -29,7 +29,7 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:8080
       Receiver__SigningSecret: ${RECEIVER_SIGNING_SECRET:-relayforge-demo-receiver-secret}
-    ports: ["${RECEIVER_PORT:-5001}:8080"]
+    ports: ["127.0.0.1:${RECEIVER_PORT:-5001}:8080"]
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"]
       interval: 3s
@@ -47,7 +47,7 @@ services:
       OutboundDelivery__AllowedPrivateHosts__0: unstable-receiver
       DeliveryWorker__PollInterval: 00:00:00.250
     volumes: ["relayforge-keys:/var/lib/relayforge/keys"]
-    ports: ["${API_PORT:-5000}:8080"]
+    ports: ["127.0.0.1:${API_PORT:-5000}:8080"]
     depends_on:
       migrations: { condition: service_completed_successfully }
       unstable-receiver: { condition: service_healthy }
@@ -60,7 +60,7 @@ services:
     build:
       context: .
       dockerfile: src/RelayForge.Web/Dockerfile
-    ports: ["${WEB_PORT:-5173}:8080"]
+    ports: ["127.0.0.1:${WEB_PORT:-5173}:8080"]
     depends_on:
       api: { condition: service_healthy }
     healthcheck:
