@@ -26,10 +26,10 @@ public sealed class DeliveryDispatcher(DeliveryLeaseRepository repository, IHttp
             var timestamp = startedAt.ToUnixTimeSeconds();
             using var request = new HttpRequestMessage(HttpMethod.Post, lease.Url) { Content = new ByteArrayContent(body) };
             request.Content.Headers.ContentType = new("application/json");
-            request.Headers.Add("X-RelayForge-Delivery", lease.DeliveryId.ToString("D"));
-            request.Headers.Add("X-RelayForge-Timestamp", timestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            request.Headers.Add("RelayForge-Delivery-Id", lease.DeliveryId.ToString("D"));
+            request.Headers.Add("RelayForge-Timestamp", timestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
             var signature = WebhookSigner.Sign(Encoding.UTF8.GetBytes(secret), timestamp, lease.DeliveryId, body);
-            request.Headers.Add("X-RelayForge-Signature", signature);
+            request.Headers.Add("RelayForge-Signature", signature);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); timeout.CancelAfter(lease.Timeout);
             using var response = await clients.CreateClient("RelayForgeDelivery").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             status = (int)response.StatusCode;
